@@ -358,6 +358,9 @@ node scratch/test-storage-and-sync.mjs
 # Verify server health and provider status
 node scratch/check-health.mjs
 ```
+---
+## Architecture pipeline designed by me 
+<img width="700" height="1100" alt="WhatsApp Image 2026-10-05 at 15 29 24" src="https://github.com/user-attachments/assets/e7269301-129a-4e5d-9426-b98eb3244a96" />
 
 ---
 
