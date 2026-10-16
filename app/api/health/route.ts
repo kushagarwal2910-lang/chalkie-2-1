@@ -1,4 +1,5 @@
 import { resolveProviderCredentials } from "@/lib/provider-credentials";
+import { TEXT_MODEL, VISION_MODEL } from "@/lib/models";
 
 export const dynamic = "force-dynamic";
 
@@ -15,8 +16,9 @@ export async function GET() {
       tavilySource: providers.tavilySource,
       embeddings: Boolean(process.env.EMBEDDING_BASE_URL && process.env.EMBEDDING_API_KEY && process.env.EMBEDDING_MODEL),
       googleDrive: Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && process.env.SESSION_SECRET),
-      tldrawLicense: Boolean(process.env.NEXT_PUBLIC_TLDRAW_LICENSE_KEY),
+      canvas: "excalidraw",
+      visionModel: VISION_MODEL,
     },
-    model: "openai/gpt-oss-120b",
+    model: TEXT_MODEL,
   });
 }

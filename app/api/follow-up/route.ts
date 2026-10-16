@@ -5,6 +5,7 @@ import { getGroqQuotaSnapshot, GroqFreeLimitError, type GroqCallOptions } from "
 import { providerEventStream } from "@/lib/provider-response";
 import { lessonPlanSchema } from "@/lib/lesson-schema";
 import { retrieveSessionContext } from "@/lib/research";
+import { ResearchError } from "@/lib/research-evidence";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -34,6 +35,9 @@ export async function POST(request: NextRequest) {
     send("status", { stage: "understanding", message: "Understanding your doubt" });
     send("status", { stage: "retrieving", message: "Retrieving from this lesson's research index" });
     const research = await retrieveSessionContext(input.question, input.sessionId, input.currentLesson.sources, groqOptions);
+    if (!research.context.trim()) {
+      throw new ResearchError("NO_RESEARCH_EVIDENCE", "This lesson has no saved research. Start a new topic to retrieve evidence; follow-ups do not run new web searches.");
+    }
     send("status", { stage: "checking_canvas", message: research.indexed ? "Checking the indexed evidence against the current canvas" : "Checking saved source evidence against the current canvas" });
     const plan = await createFollowUpWithGroq(input.question, research.context, research.sources, input.currentLesson, groqOptions);
     send("decision", { coverage: plan.coverage, targetIds: plan.targetIds, title: plan.title });

@@ -124,7 +124,12 @@ export function ChalkieHome() {
 
   function begin(questionText: string) {
     const value = questionText.trim();
-    if (value.length >= 3) router.push(`/studio?q=${encodeURIComponent(value)}`);
+    if (value.length >= 3) {
+      if (typeof window !== "undefined") {
+        window.localStorage.removeItem("chalkie:current-lesson");
+      }
+      router.push(`/studio?q=${encodeURIComponent(value)}`);
+    }
   }
   function submit(event: FormEvent) { event.preventDefault(); begin(question); }
   async function openLesson(lesson: LessonPlan) {

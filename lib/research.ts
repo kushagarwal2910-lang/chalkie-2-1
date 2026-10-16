@@ -2,6 +2,8 @@ import crypto from "node:crypto";
 import type { ResearchSource } from "@/lib/lesson-schema";
 import type { GroqCallOptions } from "@/lib/groq-pool";
 import { resolveProviderCredentials } from "@/lib/provider-credentials";
+import { ResearchError, requireResearchEvidence } from "./research-evidence";
+import { relevantExcerpt, researchQuery, sourceAuthority, usableEvidenceUrl } from "./research-quality";
 
 type TavilyResult = { title?: string; url?: string; content?: string; raw_content?: string; score?: number };
 type ResearchChunk = { id: string; sourceId: string; title: string; url: string; text: string; lexical: number; semantic: number; score: number };
@@ -82,21 +84,29 @@ function indexKey(sessionId: string) {
 
 async function rankChunks(question: string, chunks: ResearchChunk[], groqOptions: GroqCallOptions = {}): Promise<ResearchChunk[]> {
   groqOptions.signal?.throwIfAborted();
-  const rescored = chunks.map((chunk) => ({ ...chunk, lexical: lexicalScore(question, chunk.text), semantic: 0, score: 0 }));
-  const candidatePool = rescored.sort((a, b) => b.lexical - a.lexical).slice(0, 30);
+  const rescored = chunks.filter(chunk => usableEvidenceUrl(chunk.url)).map((chunk) => {
+    const text = relevantExcerpt(researchQuery(question), chunk.text);
+    return { ...chunk, text, lexical: lexicalScore(researchQuery(question), text), semantic: 0, score: 0 };
+  });
+  const candidatePool = rescored.sort((a, b) => (b.lexical + sourceAuthority(b.url) * 0.2) - (a.lexical + sourceAuthority(a.url) * 0.2)).slice(0, 30);
   const vectors = await embeddings([question, ...candidatePool.map((chunk) => chunk.text)], groqOptions.signal);
   if (vectors?.length === candidatePool.length + 1) {
     const queryVector = vectors[0];
     candidatePool.forEach((chunk, index) => { chunk.semantic = Math.max(0, cosine(queryVector, vectors[index + 1])); });
   }
-  candidatePool.forEach((chunk) => { chunk.score = vectors ? (chunk.semantic * 0.62 + chunk.lexical * 0.38) : chunk.lexical; });
+  candidatePool.forEach((chunk) => { chunk.score = (vectors ? (chunk.semantic * 0.62 + chunk.lexical * 0.38) : chunk.lexical) + sourceAuthority(chunk.url) * 0.2; });
   // Indexing must NOT burn the user's Groq teaching quota. The hybrid lexical/semantic
   // ranking provides high-quality retrieval without consuming Groq tokens.
-  return candidatePool.sort((a, b) => b.score - a.score).slice(0, 6);
+  const perSource = new Map<string, number>();
+  return candidatePool.sort((a, b) => b.score - a.score).filter(chunk => {
+    const count = perSource.get(chunk.sourceId) ?? 0;
+    if (count >= 2) return false;
+    perSource.set(chunk.sourceId, count + 1); return true;
+  }).slice(0, 6);
 }
 
 function contextFromChunks(chunks: ResearchChunk[]) {
-  return chunks.map((chunk, index) => `[${index + 1}] ${chunk.title}\nURL: ${chunk.url}\n${chunk.text.slice(0, 550)}`).join("\n\n");
+  return chunks.map((chunk, index) => `[${index + 1}] ${chunk.title}\nURL: ${chunk.url}\n${chunk.text}`).join("\n\n");
 }
 
 async function saveIndex(sessionId: string, index: ResearchIndex) {
@@ -134,7 +144,7 @@ export async function retrieveSessionContext(question: string, sessionId: string
 export async function researchQuestion(question: string, sessionId: string, groqOptions: GroqCallOptions = {}): Promise<{ sources: ResearchSource[]; context: string }> {
   groqOptions.signal?.throwIfAborted();
   const tavilyKey = (await resolveProviderCredentials()).tavilyKey;
-  if (!tavilyKey) return { sources: [], context: "" };
+  if (!tavilyKey) throw new ResearchError("RESEARCH_REQUIRED", "Add a Tavily key in provider settings to research this lesson. Live lessons require retrieved sources.");
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new DOMException("Research request timed out", "TimeoutError")), 35000);
@@ -144,22 +154,27 @@ export async function researchQuestion(question: string, sessionId: string, groq
       method: "POST",
       signal: groqOptions.signal ? AbortSignal.any([groqOptions.signal, controller.signal]) : controller.signal,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ api_key: tavilyKey, query: question, max_results: 20, search_depth: "advanced", include_raw_content: "markdown", include_answer: false }),
+      body: JSON.stringify({ api_key: tavilyKey, query: researchQuery(question), max_results: 20, search_depth: "advanced", include_raw_content: "markdown", include_answer: false }),
     });
-    if (!response.ok) throw new Error(`Tavily search failed (${response.status})`);
+    if (!response.ok) throw new ResearchError("RESEARCH_UNAVAILABLE", "Tavily research failed. Check the key or its quota, then retry. No unsourced lesson was generated.");
     results = ((await response.json()) as { results?: TavilyResult[] }).results ?? [];
+  } catch (error) {
+    groqOptions.signal?.throwIfAborted();
+    if (error instanceof ResearchError) throw error;
+    throw new ResearchError("RESEARCH_UNAVAILABLE", "Research could not be retrieved. Please retry; no unsourced lesson was generated.");
   } finally {
     clearTimeout(timer);
   }
 
   const seen = new Set<string>();
   const unique = results.filter((result) => {
-    if (!result.url) return false;
+    if (!result.url || !(result.raw_content || result.content)?.trim()) return false;
+    if (!usableEvidenceUrl(result.url)) return false;
     const normalized = result.url.replace(/[#?].*$/, "").replace(/\/$/, "");
     if (seen.has(normalized)) return false;
     seen.add(normalized);
     return true;
-  }).slice(0, 20);
+  }).sort((a, b) => sourceAuthority(b.url!) - sourceAuthority(a.url!)).slice(0, 20);
 
   const sources: ResearchSource[] = unique.map((result, index) => ({
     id: `source-${index + 1}`,
@@ -183,5 +198,6 @@ export async function researchQuestion(question: string, sessionId: string, groq
   await saveIndex(sessionId, { question, sources, chunks: storedChunks, indexedAt: Date.now() });
   const ranked = await rankChunks(question, storedChunks, groqOptions);
   const context = contextFromChunks(ranked);
+  requireResearchEvidence(context, sources);
   return { sources, context };
 }

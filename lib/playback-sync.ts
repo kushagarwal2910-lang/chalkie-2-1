@@ -89,6 +89,7 @@ export function playDeviceNarration(
   utterance.onboundary = (event) => {
     if (finished || signal.aborted || !started) return;
     if (event.name !== "word" && event.name !== "sentence") return;
+    if (typeof window !== "undefined") window.dispatchEvent(new Event("chalkie:speech-boundary"));
     clearTimers();
     const target = targetAtCharacter(cues, event.charIndex);
     if (target) onTarget(target);

@@ -137,9 +137,9 @@ export async function applyElkLayout(rawPlan: LessonPlan, options: ElkLayoutOpti
   const plan = normalizeLessonLayout(rawPlan);
   if (!plan.objects.length) return plan;
   const parents = assignParents(plan.objects, rawPlan.objects);
-  const direction = options.direction ?? (/\b(hierarchy|tree|classification|atmospher|strata|altitude|vertical|layers|stack)\b/i.test(`${plan.diagramType} ${plan.question} ${plan.visualStrategy}`) ? "DOWN" : "RIGHT");
-  const nodeSpacing = Math.max(32, options.nodeSpacing ?? 48);
-  const layerSpacing = Math.max(48, options.layerSpacing ?? 100);
+  const direction = options.direction ?? (plan.teachingMode === "worked-example" || /\b(hierarchy|tree|classification|atmospher|strata|altitude|vertical|layers|stack)\b/i.test(`${plan.diagramType} ${plan.question} ${plan.visualStrategy}`) ? "DOWN" : "RIGHT");
+  const nodeSpacing = Math.max(56, options.nodeSpacing ?? 64);
+  const layerSpacing = Math.max(90, options.layerSpacing ?? 120);
   let rootId = "__chalkie_root";
   const usedIds = new Set([...plan.objects.map((object) => object.id), ...plan.connections.map((connection) => connection.id)]);
   while (usedIds.has(rootId)) rootId += "_";
@@ -173,15 +173,21 @@ export async function applyElkLayout(rawPlan: LessonPlan, options: ElkLayoutOpti
       "elk.hierarchyHandling": "INCLUDE_CHILDREN",
       "elk.padding": `[top=${options.padding ?? EDGE},left=${options.padding ?? EDGE},bottom=${options.padding ?? EDGE},right=${options.padding ?? EDGE}]`,
       "elk.spacing.nodeNode": String(nodeSpacing),
-      "elk.spacing.edgeNode": "24",
-      "elk.spacing.edgeEdge": "16",
+      "elk.spacing.edgeNode": "44",
+      "elk.spacing.edgeEdge": "36",
       "elk.layered.spacing.nodeNodeBetweenLayers": String(layerSpacing),
-      "elk.layered.spacing.edgeNodeBetweenLayers": "24",
-      "elk.layered.spacing.edgeEdgeBetweenLayers": "16",
+      "elk.layered.spacing.edgeNodeBetweenLayers": "44",
+      "elk.layered.spacing.edgeEdgeBetweenLayers": "36",
+      "elk.spacing.portPort": "32",
+      "elk.layered.spacing.portPortBetweenLayers": "32",
       "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
+      "elk.layered.nodePlacement.favorStraightEdges": "true",
+      "elk.layered.unnecessaryBendpoints": "false",
       "elk.layered.mergeEdges": "false",
       "elk.separateConnectedComponents": "true",
-      "elk.spacing.componentComponent": "80",
+      "elk.spacing.componentComponent": "110",
+      "elk.edgeLabels.inline": "false",
+      "elk.spacing.edgeLabel": "16",
     },
     children: plan.objects.filter((object) => !parents.has(object.id)).map(buildNode),
     edges: plan.connections.map((connection): ElkExtendedEdge => ({

@@ -1,8 +1,8 @@
 {
   "name": "chalkie-ai-whiteboard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "packageManager": "pnpm@9.15.4",
+  "packageManager": "npm@11.13.0",
   "engines": {
     "node": ">=22.13.0"
   },
@@ -10,14 +10,16 @@
     "dev": "node server.mjs",
     "dev:next": "next dev",
     "dev:vercel": "vercel dev",
-    "build": "next build && node scripts/verify-build-styles.mjs",
+    "build": "node scripts/copy-speech-runtime.mjs && next build && node scripts/verify-build-styles.mjs",
     "start": "node server.mjs",
     "start:next": "next start",
     "lint": "eslint . --ignore-pattern .next",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "postinstall": "node scripts/copy-excalidraw-fonts.mjs && node scripts/copy-speech-runtime.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
+    "@excalidraw/excalidraw": "^0.18.1",
     "@hookform/resolvers": "^5.7.1",
     "@shadcn/react": "^0.3.0",
     "@types/dagre": "^0.7.54",
@@ -29,7 +31,10 @@
     "date-fns": "^4.4.0",
     "elkjs": "^0.12.0",
     "embla-carousel-react": "^8.6.0",
+    "image-size": "^2.0.2",
     "input-otp": "^1.4.2",
+    "kokoro-js": "1.2.1",
+    "kokoro-ort-runtime": "npm:onnxruntime-web@1.22.0-dev.20250409-89f8206ba4",
     "lucide-react": "^1.31.0",
     "next": "16.3.4",
     "next-themes": "^0.4.6",
@@ -42,7 +47,6 @@
     "recharts": "^3.8.0",
     "sonner": "^2.0.8",
     "tailwind-merge": "3.6.0",
-    "tldraw": "^5.4.0",
     "vaul": "^1.1.2",
     "ws": "^8.18.3",
     "zod": "^3.25.76"
@@ -60,6 +64,5 @@
     "typescript": "5.9.3",
     "vercel": "^54.14.2"
   },
-  "type": "module",
-  "packageManager": "pnpm@11.0.0"
+  "type": "module"
 }

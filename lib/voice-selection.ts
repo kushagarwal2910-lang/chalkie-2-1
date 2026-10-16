@@ -81,7 +81,8 @@ export function getRankedVoices(voices: SpeechSynthesisVoice[]): SpeechSynthesis
  */
 export function getBestAvailableVoice(
   voices: SpeechSynthesisVoice[],
-  preferredUri?: string | null
+  preferredUri?: string | null,
+  avatar?: AvatarVoiceStyle,
 ): SpeechSynthesisVoice | null {
   if (!voices.length) return null;
 
@@ -93,7 +94,36 @@ export function getBestAvailableVoice(
 
   // 2. Otherwise pick the highest-ranked natural voice
   const ranked = getRankedVoices(voices);
+  if (avatar && avatar !== "chalk") {
+    const desired = avatar === "mira" ? FEMININE_VOICES : MASCULINE_VOICES;
+    const opposite = avatar === "mira" ? MASCULINE_VOICES : FEMININE_VOICES;
+    // Web Speech exposes no gender metadata. Match known voices before quality;
+    // an unknown voice is preferable to a known mismatched default.
+    return ranked.find(v => desired.test(v.name)) ?? ranked.find(v => !opposite.test(v.name)) ?? ranked[0] ?? null;
+  }
   return ranked[0] || null;
+}
+
+const FEMININE_VOICES = /\b(jenny|aria|zira|hazel|susan|samantha|karen|moira|ava|serena|sara|sonia|libby|neerja|female)\b/i;
+const MASCULINE_VOICES = /\b(guy|david|mark|george|daniel|alex|oliver|ryan|eric|christopher|gavin|ravi|male)\b/i;
+export type AvatarVoiceStyle = "mira" | "arjun" | "chalk";
+export interface AvatarVoicePreferences { uri: string | null; rate: number; pitch: number }
+export const AVATAR_VOICE_DEFAULTS: Record<AvatarVoiceStyle, AvatarVoicePreferences> = {
+  mira: { uri: null, rate: 0.92, pitch: 1.04 },
+  arjun: { uri: null, rate: 0.92, pitch: 1 },
+  chalk: { uri: null, rate: 1, pitch: 1.12 },
+};
+export function voicePreferenceKey(avatar: AvatarVoiceStyle) { return `chalkie:voice:${avatar}`; }
+export function readAvatarVoicePreferences(avatar: AvatarVoiceStyle, storage: Pick<Storage, "getItem">): AvatarVoicePreferences {
+  const defaults = AVATAR_VOICE_DEFAULTS[avatar];
+  try {
+    const raw = JSON.parse(storage.getItem(voicePreferenceKey(avatar)) || "{}");
+    return {
+      uri: typeof raw.uri === "string" && raw.uri.length ? raw.uri : null,
+      rate: typeof raw.rate === "number" && Number.isFinite(raw.rate) && raw.rate >= 0.7 && raw.rate <= 1.3 ? raw.rate : defaults.rate,
+      pitch: typeof raw.pitch === "number" && Number.isFinite(raw.pitch) && raw.pitch >= 0.85 && raw.pitch <= 1.2 ? raw.pitch : defaults.pitch,
+    };
+  } catch { return { ...defaults }; }
 }
 
 /**

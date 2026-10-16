@@ -5,7 +5,6 @@ import { getGroqQuotaSnapshot, GroqFreeLimitError, type GroqCallOptions } from "
 import { resolveProviderCredentials } from "@/lib/provider-credentials";
 import { providerEventStream } from "@/lib/provider-response";
 import { researchQuestion } from "@/lib/research";
-import type { ResearchSource } from "@/lib/lesson-schema";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -14,7 +13,7 @@ const requestSchema = z.object({
   question: z.string().trim().min(3).max(1000),
   sessionId: z.string().trim().min(1).max(120).optional(),
   preferredGroqKeyId: z.string().trim().max(32).optional(),
-  useWeb: z.boolean().default(true),
+  useWeb: z.literal(true).default(true),
 });
 
 export async function POST(request: NextRequest) {
@@ -39,18 +38,12 @@ export async function POST(request: NextRequest) {
       timeoutMs: 180_000,
       onStatus: (status) => send("provider_status", status),
     };
-    let sources: ResearchSource[] = [];
-    let context = "";
-    if (input.useWeb && credentials.tavilyKey) {
-      send("status", { stage: "research", message: "Searching and deduplicating up to 20 sources" });
-      const research = await researchQuestion(input.question, input.sessionId ?? crypto.randomUUID(), groqOptions);
-      sources = research.sources;
-      context = research.context;
-      send("sources", { sources, indexed: true });
-      send("status", { stage: "ranking", message: `Indexed ${sources.length} sources · combining semantic and lexical relevance` });
-    }
+    send("status", { stage: "research", message: "Searching and deduplicating up to 20 sources" });
+    const { sources, context } = await researchQuestion(input.question, input.sessionId ?? crypto.randomUUID(), groqOptions);
+    send("sources", { sources, indexed: true });
+    send("status", { stage: "ranking", message: `Indexed ${sources.length} sources · ranking relevant passages` });
     send("status", { stage: "visualizing", message: "Designing a visual explanation" });
-    const lesson = await createLessonWithGroq(input.question, context || "No web context supplied. Use stable general knowledge and state uncertainty.", sources, groqOptions);
+    const lesson = await createLessonWithGroq(input.question, context, sources, groqOptions);
     send("lesson", { lesson: { ...lesson, sources }, mode: "live" });
   });
 }

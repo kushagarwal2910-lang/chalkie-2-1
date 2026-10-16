@@ -1,4 +1,4 @@
-import { resolveProviderCredentials } from "./provider-credentials";
+import { resolveProviderCredentials } from "./provider-credentials.ts";
 import { GroqPool, type GroqCallOptions } from "./groq-pool-core.ts";
 
 export {

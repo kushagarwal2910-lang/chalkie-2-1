@@ -1,4 +1,5 @@
 import { GroqFreeLimitError, GroqHttpError, type GroqQuotaSnapshot } from "./groq-pool";
+import { ResearchError } from "./research-evidence";
 
 export interface ProviderFailure {
   code: string;
@@ -17,6 +18,9 @@ export function providerFailure(error: unknown, latestQuota?: GroqQuotaSnapshot)
   const details = error as { code?: string; name?: string; quota?: GroqQuotaSnapshot } | undefined;
   const quota = error instanceof GroqFreeLimitError ? error.quota : details?.quota ?? latestQuota;
   const retry = { ...(quota ? { quota } : {}), ...(quota?.nextRetryAt ? { nextRetryAt: quota.nextRetryAt } : {}) };
+  if (error instanceof ResearchError) {
+    return { status: error.code === "RESEARCH_REQUIRED" ? 422 : 502, failure: { code: error.code, message: error.message, retryable: true, ...retry } };
+  }
   if (error instanceof GroqFreeLimitError) {
     return { status: 429, failure: { code: error.code, message: error.message,
       retryable: !["no_keys", "all_keys_invalid"].includes(quota?.degradationReason ?? ""), ...retry } };

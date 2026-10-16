@@ -1,14 +1,14 @@
 FROM node:22-slim AS base
 WORKDIR /app
 
-# Install pnpm directly
-RUN npm install -g pnpm@latest
+# Use the npm version bundled with Node.js.
+# npm ships with Node.js
 
 # --- Dependencies stage ---
 FROM base AS deps
 WORKDIR /app
-COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts
 
 # --- Builder stage ---
 FROM base AS builder
@@ -17,9 +17,8 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
-ARG NEXT_PUBLIC_TLDRAW_LICENSE_KEY
-ENV NEXT_PUBLIC_TLDRAW_LICENSE_KEY=$NEXT_PUBLIC_TLDRAW_LICENSE_KEY
-RUN pnpm run build
+
+RUN node scripts/copy-excalidraw-fonts.mjs && npm run build
 
 # --- Runner stage ---
 FROM base AS runner

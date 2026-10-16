@@ -1,3 +1,5 @@
+import { sanitizeNarrationForSpeech } from "./local-speech.ts";
+
 /**
  * Formats lesson narration text to optimize pronunciation, clarity,
  * and natural pause cadence for AI speech synthesis.
@@ -51,8 +53,12 @@ const ABBREVIATION_REPLACEMENTS: [RegExp, string][] = [
   [/\bvs\.?\s*/gi, "versus "],
   [/\bapprox\.?\s*/gi, "approximately "],
   [/\betc\.?\s*/gi, "and so on. "],
-  [/\bmin\.?\s*/gi, "minutes "],
-  [/\bsec\.?\s*/gi, "seconds "],
+  [/(?<![-a-zA-Z0-9])min\.(?=\s|$)/gi, "minutes "],
+  [/(?<=\d\s*)min\b(?![-a-zA-Z0-9])/gi, "minutes"],
+  [/(?<![-a-zA-Z0-9])\bmin\b(?![-a-zA-Z0-9])/gi, "minutes"],
+  [/(?<![-a-zA-Z0-9])sec\.(?=\s|$)/gi, "seconds "],
+  [/(?<=\d\s*)sec\b(?![-a-zA-Z0-9])/gi, "seconds"],
+  [/(?<![-a-zA-Z0-9])\bsec\b(?![-a-zA-Z0-9])/gi, "seconds"],
   [/\bdept\.?\s*/gi, "department "],
   [/\bno\.\s*(\d+)/gi, "number $1"],
 ];
@@ -91,7 +97,7 @@ const SYMBOL_REPLACEMENTS: [RegExp, string][] = [
 export function formatNarrationForSpeech(text: string): string {
   if (!text) return "";
 
-  let formatted = text;
+  let formatted = sanitizeNarrationForSpeech(text);
 
   // 1. Expand technical units
   for (const [pattern, replacement] of UNIT_REPLACEMENTS) {
@@ -132,6 +138,9 @@ export function formatNarrationForSpeech(text: string): string {
   formatted = formatted.replace(/,\s*,+/g, ", ");
   formatted = formatted.replace(/,\s*([.!?])/g, "$1");
   formatted = formatted.replace(/\s{2,}/g, " ").trim();
+
+  // Final sanitation sweep for stray markdown or characters
+  formatted = sanitizeNarrationForSpeech(formatted);
 
   // Ensure clean terminal punctuation so the voice doesn't clip the final syllable
   if (!/[.!?]$/.test(formatted)) {

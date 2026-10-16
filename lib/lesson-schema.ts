@@ -1,11 +1,14 @@
 import { z } from "zod";
+import { imageAnnotationSchema, type ImageAnnotation } from "./visual-agent-schema.ts";
+export { imageAnnotationSchema, type ImageAnnotation };
 
 export const canvasColors = ["ink", "slate", "blue", "cyan", "violet", "orange", "green", "red", "yellow", "white", "gray", "none"] as const;
 export type CanvasColor = typeof canvasColors[number];
 
 export const diagramTypes = ["mechanism", "spatial", "structure", "cycle", "process", "comparison", "timeline", "system", "quantitative"] as const;
+export const teachingModes = ["reference", "sequence", "comparison", "worked-example", "concept"] as const;
 export const visualRoles = ["subject", "component", "environment", "container", "input", "output", "force", "annotation", "energy", "motion", "field", "path", "layer", "formula"] as const;
-export const visualShapeTypes = ["custom", "custom-chart", "custom-svg", "custom-template", "geo", "note", "frame"] as const;
+export const visualShapeTypes = ["custom", "custom-chart", "custom-svg", "custom-template", "geo", "note", "frame", "image"] as const;
 export const connectionArrowheads = ["none", "arrow", "triangle", "dot", "diamond", "bar"] as const;
 export const labelPlacements = ["inside", "below", "above", "left", "right", "none"] as const;
 export type LabelPlacement = typeof labelPlacements[number];
@@ -13,7 +16,7 @@ export type LabelPlacement = typeof labelPlacements[number];
 export const safeColorSchema = z.preprocess((val) => {
   if (typeof val !== "string") return "slate";
   const s = val.trim().toLowerCase();
-  if (canvasColors.includes(s as any)) return s;
+  if (canvasColors.includes(s as never)) return s;
   if (s === "grey" || s === "silver" || s === "metal") return "gray";
   if (s === "black" || s === "dark") return "ink";
   if (s === "purple" || s === "magenta") return "violet";
@@ -24,7 +27,7 @@ export const safeColorSchema = z.preprocess((val) => {
 export const safeLabelPlacementSchema = z.preprocess((val) => {
   if (typeof val !== "string") return "below";
   const s = val.trim().toLowerCase();
-  if (labelPlacements.includes(s as any)) return s;
+  if (labelPlacements.includes(s as never)) return s;
   if (s === "top") return "above";
   if (s === "bottom") return "below";
   if (s === "center" || s === "middle") return "inside";
@@ -61,16 +64,36 @@ export const visualPartSchema = z.object({
   opacity: z.coerce.number().default(1),
 });
 
+export const imageRegionSchema = z.object({
+  label: z.string().min(1).max(100),
+  x: z.number().finite().min(0).max(1), y: z.number().finite().min(0).max(1),
+  width: z.number().finite().positive().max(1), height: z.number().finite().positive().max(1),
+  confidence: z.number().min(0).max(1),
+}).refine(r => r.x + r.width <= 1.001 && r.y + r.height <= 1.001, "Region exceeds image");
+
+export const imageAssetSchema = z.object({
+  description: z.string().max(600).optional(),
+  id: z.string().max(100), title: z.string().max(300), url: z.string().url(),
+  sourceUrl: z.string().url(), author: z.string().max(500), license: z.string().max(100),
+  licenseUrl: z.string().url(), width: z.number().positive(), height: z.number().positive(),
+  regions: z.array(imageRegionSchema).max(12),
+});
+export type ImageAsset = z.infer<typeof imageAssetSchema>;
+
 export const visualObjectSchema = z.object({
+  comparisonSide: z.enum(["left", "right", "full"]).optional(),
+  image: imageAssetSchema.optional(),
+  imageRequest: z.object({ query: z.string().max(160), status: z.enum(["ready", "not_found", "rejected", "unavailable"]) }).optional(),
+  annotations: z.array(imageAnnotationSchema).optional(),
   id: z.string().min(1).max(200),
   parentId: z.string().max(200).optional(),
   role: z.preprocess((val) => {
     const s = String(val ?? "").toLowerCase();
-    return visualRoles.includes(s as any) ? s : "component";
+    return visualRoles.includes(s as never) ? s : "component";
   }, z.enum(visualRoles)),
   shapeType: z.preprocess((val) => {
     const s = String(val ?? "").toLowerCase();
-    return visualShapeTypes.includes(s as any) ? s : "custom";
+    return visualShapeTypes.includes(s as never) ? s : "custom";
   }, z.enum(visualShapeTypes)).default("custom"),
   geo: z.string().optional(),
   color: safeColorSchema.optional(),
@@ -111,7 +134,7 @@ export const visualConnectionSchema = z.object({
   }, z.enum(["top", "right", "bottom", "left", "center"])),
   arrowhead: z.preprocess((val) => {
     const s = String(val ?? "").toLowerCase();
-    return connectionArrowheads.includes(s as any) ? s : "arrow";
+    return connectionArrowheads.includes(s as never) ? s : "arrow";
   }, z.enum(connectionArrowheads)).default("arrow"),
   bend: z.preprocess((val) => Number(val) || 0, z.number().default(0)),
   // Computed by the layout engine, in canvas page coordinates. These are not
@@ -135,6 +158,8 @@ export const lessonSegmentSchema = z.object({
 });
 
 export const lessonPlanSchema = z.object({
+  version: z.literal(2).optional(),
+  teachingMode: z.enum(teachingModes).optional(),
   id: z.preprocess((val) => (val ? String(val) : `lesson-${Date.now()}`), z.string().min(1).max(80).default(() => `lesson-${Date.now()}`)),
   title: z.preprocess((val) => (val == null ? "" : String(val)), z.string().default("")),
   question: z.string().min(1).max(1000),
@@ -148,6 +173,8 @@ export const lessonPlanSchema = z.object({
 });
 
 export const followUpPlanSchema = z.object({
+  teachingMode: z.enum(teachingModes).optional(),
+  sources: z.array(researchSourceSchema).max(20).optional(),
   id: z.preprocess((val) => (val ? String(val) : `follow-up-${Date.now()}`), z.string().min(1).max(80).default(() => `follow-up-${Date.now()}`)),
   title: z.preprocess((val) => (val == null ? "" : String(val)), z.string().default("")),
   answer: z.string().min(1).max(2400),

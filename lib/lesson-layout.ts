@@ -1,4 +1,4 @@
-import type { LessonPlan, VisualObject, VisualPart } from "./lesson-schema";
+import type { LessonPlan, VisualPart } from "./lesson-schema";
 import { formatMathFormula } from "./math-formatter.ts";
 import { getVisualFootprint } from "./visual-footprint.ts";
 
@@ -151,14 +151,15 @@ const detailedVisualRoles = new Set(["subject", "component", "input", "output"])
 
 
 export function repairAndValidateLessonPlan(plan: LessonPlan): LessonPlan {
+  // Version 2 has already been validated and laid out. Legacy repair rewrites
+  // flowchart nodes into physical diagrams and must not touch the new contract.
+  if (plan.version === 2) return structuredClone(plan);
   // Do not mutate a lesson used by playback or the caller.
   plan = structuredClone(plan);
   if (!Array.isArray(plan.objects)) plan.objects = [];
   if (!Array.isArray(plan.connections)) plan.connections = [];
   if (!Array.isArray(plan.segments)) plan.segments = [];
   if (!Array.isArray(plan.sources)) plan.sources = [];
-
-  const qLower = (plan.question || "").toLowerCase();
 
   // 1. Convert any legacy shapeType: "geo" or non-formula "note" to "custom"
   // and enforce minimum dimensions so labels NEVER wrap into "Moo n", "grav ity", etc.
@@ -458,14 +459,15 @@ export function repairAndValidateLessonPlan(plan: LessonPlan): LessonPlan {
         obj.height = Math.max(140, obj.height);
         const w = obj.width;
         const h = obj.height;
-        const isInput = obj.role === "input";
-        const isOutput = obj.role === "output";
+        const role = obj.role || "component";
+        const isInput = role === "input";
+        const isOutput = role === "output";
         const accentColor = isInput ? "blue" : isOutput ? "green" : "cyan";
 
         obj.parts = [
           { type: "rect", x: 10, y: 10, width: w - 20, height: 28, fill: "slate", stroke: "ink", strokeWidth: 1.5, opacity: 0.9, text: obj.label, data: "" },
           { type: "rect", x: 10, y: 44, width: w - 20, height: h - 56, fill: "none", stroke: "slate", strokeWidth: 1.5, opacity: 0.8, text: "", data: "" },
-          { type: "wave", x: 22, y: 56, width: w - 44, height: Math.max(20, h - 84), fill: "none", stroke: accentColor, strokeWidth: 2.2, opacity: 0.9, text: `${obj.role.toUpperCase()} STAGE`, data: "3" },
+          { type: "wave", x: 22, y: 56, width: w - 44, height: Math.max(20, h - 84), fill: "none", stroke: accentColor, strokeWidth: 2.2, opacity: 0.9, text: `${role.toUpperCase()} STAGE`, data: "3" },
           { type: "ellipse", x: 4, y: h / 2 - 6, width: 12, height: 12, fill: accentColor, stroke: "white", strokeWidth: 1.5, opacity: 1, text: "", data: "point" },
           { type: "ellipse", x: w - 16, y: h / 2 - 6, width: 12, height: 12, fill: accentColor, stroke: "white", strokeWidth: 1.5, opacity: 1, text: "", data: "point" },
         ];

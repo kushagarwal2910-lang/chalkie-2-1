@@ -1,5 +1,5 @@
 import type { Metadata, Viewport } from "next";
-import "tldraw/tldraw.css";
+import "@excalidraw/excalidraw/index.css";
 import "./chalkie.css";
 
 export const metadata: Metadata = {

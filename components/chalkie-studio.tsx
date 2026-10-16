@@ -2,6 +2,7 @@
 
 import dynamic from "next/dynamic";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import {
   BookOpen,
   Check,
@@ -35,6 +36,10 @@ import {
   SlidersHorizontal,
   MoreHorizontal,
   ArrowUpRight,
+  Maximize2,
+  Minimize2,
+  ChevronLeft,
+  ChevronRight,
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { followUpPlanSchema, lessonPlanSchema, type LessonPlan, type LessonSegment } from "@/lib/lesson-schema";
@@ -47,18 +52,19 @@ import { newestProviderQuota, parseProviderFailure, providerFailureError, provid
 import { readProviderEventStream } from "@/lib/provider-event-stream";
 import { ChalkieIcon } from "@/components/chalkie-icon";
 import { VoiceSettingsDialog } from "@/components/voice-settings-dialog";
+import { demoLesson } from "@/lib/demo-v2";
+import { applyElkLayout } from "@/lib/elk-spatial-layout";
+import { TeacherAvatar, useAvatarStyle } from "@/components/teacher-avatar";
 import { StudioWorkspace } from "@/components/studio-workspace";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { formatNarrationForSpeech } from "@/lib/speech-formatter";
+import { generateLocalSpeech, readLocalVoice, readSpeechEngine, sanitizeNarrationForSpeech } from "@/lib/local-speech";
 import { computeTargetPositions } from "@/lib/target-matcher";
 import { getProgressiveVisibleObjects } from "@/lib/progressive-scene";
 import { CanvasPlaybackGate, playDeviceNarration, playRecordedNarration, type CanvasPlaybackState } from "@/lib/playback-sync";
 import {
   getBestAvailableVoice,
-  PREFERRED_VOICE_KEY,
-  SPEECH_RATE_KEY,
-  DEFAULT_SPEECH_RATE,
-  DEFAULT_SPEECH_PITCH,
+  readAvatarVoicePreferences,
 } from "@/lib/voice-selection";
 
 const ChalkCanvas = dynamic(
@@ -80,6 +86,21 @@ const emptyLesson: LessonPlan = {
   connections: [],
   segments: [],
 };
+
+function createEmptyLessonPlan(question = ""): LessonPlan {
+  return {
+    id: `lesson-${Date.now()}`,
+    title: question ? `Visual Lesson: ${question.slice(0, 40)}` : "New visual lesson",
+    question,
+    summary: "",
+    diagramType: "system",
+    visualStrategy: "",
+    sources: [],
+    objects: [],
+    connections: [],
+    segments: [],
+  };
+}
 
 type RetryOperation =
   | { kind: "lesson"; question: string }
@@ -128,6 +149,8 @@ function isLikelyNewTopic(q: string, current: LessonPlan): boolean {
 }
 
 export function ChalkieStudio() {
+  const searchParams = useSearchParams();
+  const [avatarStyle] = useAvatarStyle();
   const [lesson, setLesson] = useState<LessonPlan>(emptyLesson);
   const [promptMode, setPromptMode] = useState<"auto" | "doubt" | "new">("auto");
   const [isPlaying, setIsPlaying] = useState(false);
@@ -156,6 +179,26 @@ export function ChalkieStudio() {
   const [leftPanelOpen, setLeftPanelOpen] = useState(true);
   const [rightPanelOpen, setRightPanelOpen] = useState(true);
   const [activeMobilePanel, setActiveMobilePanel] = useState<"sources" | "canvas" | "studio">("canvas");
+  const [isTheaterMode, setIsTheaterMode] = useState(false);
+  const [theaterPrompt, setTheaterPrompt] = useState("");
+  const [theaterInputExpanded, setTheaterInputExpanded] = useState(false);
+
+  useEffect(() => {
+    window.dispatchEvent(new Event("resize"));
+    const t1 = setTimeout(() => window.dispatchEvent(new Event("resize")), 80);
+    const t2 = setTimeout(() => window.dispatchEvent(new Event("resize")), 280);
+    return () => { clearTimeout(t1); clearTimeout(t2); };
+  }, [isTheaterMode]);
+
+  useEffect(() => {
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && isTheaterMode) {
+        setIsTheaterMode(false);
+      }
+    };
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [isTheaterMode]);
 
   const toggleLeftPanel = () => {
     setLeftPanelOpen((prev) => !prev);
@@ -174,7 +217,7 @@ export function ChalkieStudio() {
   const providerRequestIdRef = useRef(0);
   const configuredKeysetRef = useRef<string | null>(null);
   const [retryNow, setRetryNow] = useState(() => Date.now());
-  const [sessionId] = useState(() => {
+  const [sessionId, setSessionId] = useState(() => {
     if (typeof window === "undefined") return "chalkie-session-pending";
     const stored = window.localStorage.getItem("chalkie:session");
     if (stored) return stored;
@@ -182,6 +225,9 @@ export function ChalkieStudio() {
     window.localStorage.setItem("chalkie:session", value);
     return value;
   });
+  const handledQuestionRef = useRef<string | null>(null);
+  const handledLessonIdRef = useRef<string | null>(null);
+  const initialLoadDoneRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
@@ -195,7 +241,6 @@ export function ChalkieStudio() {
   const recorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const pendingAutoplayRef = useRef<number | null>(null);
-  const startupHandledRef = useRef(false);
   const voiceMonitorRef = useRef<number | null>(null);
   const voiceContextRef = useRef<AudioContext | null>(null);
   const { status: connectionStatus, send: sendRealtime } = useRealtime(sessionId, (event) => {
@@ -259,46 +304,91 @@ export function ChalkieStudio() {
   }, []);
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const initialQuestion = params.get("q")?.trim() ?? "";
-    const lessonId = params.get("id")?.trim() ?? "";
+    const q = searchParams.get("q")?.trim() ?? "";
+    const lessonId = searchParams.get("id")?.trim() ?? "";
+    const isDemo = searchParams.get("demo") === "1";
 
-    if (initialQuestion.length >= 3) {
-      startupHandledRef.current = true;
+    if (q.length >= 3) {
+      if (handledQuestionRef.current === q) return;
+      handledQuestionRef.current = q;
+
+      const params = new URLSearchParams(window.location.search);
       params.delete("q");
       const suffix = params.toString();
       window.history.replaceState({}, "", `${window.location.pathname}${suffix ? `?${suffix}` : ""}`);
-      // Defer until after React's development mount check so the request is not aborted by its test cleanup.
-      window.setTimeout(() => void generateLesson(initialQuestion), 0);
+
+      const freshSessionId = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `session-${Date.now()}`;
+      setSessionId(freshSessionId);
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem("chalkie:session", freshSessionId);
+        window.localStorage.removeItem("chalkie:current-lesson");
+      }
+
+      setLesson(createEmptyLessonPlan(q));
+      setRevealedStep(null);
+      setActiveStep(0);
+      setVisualSegment(null);
+      setActiveTargetId(null);
+      setLastAnswer("");
+      clearPendingProviderRequest();
+      stopPlayback(true);
+
+      void generateLesson(q, freshSessionId);
       return;
     }
 
-    let cancelled = false;
-    const loader = lessonId ? loadLessonById(lessonId) : loadCurrentLesson();
+    if (isDemo) {
+      if (handledLessonIdRef.current === "demo") return;
+      handledLessonIdRef.current = "demo";
+      void applyElkLayout(demoLesson).then((laid) => {
+        setLesson(laid);
+        setGenerationStage("Demo lesson loaded");
+      }).catch(() => {
+        setLesson(demoLesson);
+        setGenerationStage("Demo lesson loaded");
+      });
+      return;
+    }
 
-    void loader.then((stored) => {
-      if (cancelled || !stored) return;
-      try {
-        const repaired = repairAndValidateLessonPlan(stored);
-        setLesson(repaired);
-        setGenerationStage("Lesson restored");
-      } catch {
-        const parsed = lessonPlanSchema.safeParse(stored);
-        if (parsed.success) {
-          setLesson(parsed.data);
-          setGenerationStage("Lesson restored");
-        } else if (stored && (stored as LessonPlan).objects?.length) {
-          setLesson(stored as LessonPlan);
-          setGenerationStage("Lesson restored");
+    if (lessonId) {
+      if (handledLessonIdRef.current === lessonId) return;
+      handledLessonIdRef.current = lessonId;
+      void loadLessonById(lessonId).then((stored) => {
+        if (!stored) return;
+        try {
+          setLesson(repairAndValidateLessonPlan(stored));
+        } catch {
+          setLesson(stored);
         }
-      }
-    }).catch(() => undefined);
+        setGenerationStage("Lesson restored");
+      });
+      return;
+    }
 
-    return () => { cancelled = true; };
-    // The URL question/restoration is consumed once on mount; changing the
-    // request callback during playback must not generate the initial topic again.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    if (!initialLoadDoneRef.current) {
+      initialLoadDoneRef.current = true;
+      let cancelled = false;
+      void loadCurrentLesson().then((stored) => {
+        if (cancelled || !stored) return;
+        try {
+          const repaired = repairAndValidateLessonPlan(stored);
+          setLesson(repaired);
+          setGenerationStage("Lesson restored");
+        } catch {
+          const parsed = lessonPlanSchema.safeParse(stored);
+          if (parsed.success) {
+            setLesson(parsed.data);
+            setGenerationStage("Lesson restored");
+          } else if (stored && (stored as LessonPlan).objects?.length) {
+            setLesson(stored as LessonPlan);
+            setGenerationStage("Lesson restored");
+          }
+        }
+      }).catch(() => undefined);
+
+      return () => { cancelled = true; };
+    }
+  }, [searchParams]);
 
   useEffect(() => {
     const handleUrlChange = () => {
@@ -343,6 +433,7 @@ export function ChalkieStudio() {
     const startIndex = pendingAutoplayRef.current;
     if (startIndex === null || !hasLesson || !lesson.segments[startIndex]) return;
     pendingAutoplayRef.current = null;
+    setIsTheaterMode(true);
     const run = playbackRunRef.current + 1;
     playbackRunRef.current = run;
     void playStep(startIndex, run);
@@ -351,7 +442,8 @@ export function ChalkieStudio() {
   }, [lesson.id, lesson.segments.length]);
 
   useEffect(() => () => {
-    abortRef.current?.abort();
+    // Note: Do not abort abortRef on unmount; React Strict Mode remounts in dev,
+    // which would abort the startup lesson generation request.
     playbackAbortRef.current?.abort();
     audioRef.current?.pause();
     if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
@@ -434,13 +526,25 @@ export function ChalkieStudio() {
     }
   }
 
-  async function generateLesson(question: string) {
+  async function generateLesson(question: string, targetSessionId?: string) {
     stopPlayback(true);
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
+    const activeSessionId = targetSessionId || (typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `session-${Date.now()}`);
+    setSessionId(activeSessionId);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("chalkie:session", activeSessionId);
+    }
     const requestId = beginProviderRequest({ kind: "lesson", question });
     const current = () => abortRef.current === controller && !controller.signal.aborted;
+
+    setLesson(createEmptyLessonPlan(question));
+    setRevealedStep(null);
+    setActiveStep(0);
+    setVisualSegment(null);
+    setActiveTargetId(null);
+    setLastAnswer("");
     setIsGenerating(true);
     setIsFollowUpGenerating(false);
     setVoiceState("thinking");
@@ -453,7 +557,7 @@ export function ChalkieStudio() {
         method: "POST",
         signal: controller.signal,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, sessionId, useWeb: true }),
+        body: JSON.stringify({ question, sessionId: activeSessionId, useWeb: true }),
       });
       if (!response.ok) throw providerFailureError(await response.json().catch(() => ({})), "The lesson connection could not be established");
       if (!response.body) throw new Error("The lesson connection could not be established");
@@ -550,7 +654,9 @@ export function ChalkieStudio() {
       pendingAutoplayRef.current = merged.startIndex;
       setLastAnswer(generated.answer);
       setActiveStep(merged.startIndex);
-      setRevealedStep(merged.startIndex - 1);
+      setRevealedStep(null);
+      setVisualSegment(merged.lesson.segments[merged.startIndex] ?? null);
+      setActiveTargetId(merged.lesson.segments[merged.startIndex]?.targetIds[0] ?? null);
       setIsPlaying(true);
       setVoiceState("thinking");
       setLesson(merged.lesson);
@@ -571,6 +677,7 @@ export function ChalkieStudio() {
     setIsPlaying(false);
     setVisualSegment(null);
     setActiveTargetId(null);
+    setRevealedStep(null);
     setVoiceState("idle");
     audioRef.current?.pause();
     audioRef.current = null;
@@ -594,16 +701,18 @@ export function ChalkieStudio() {
     audioRef.current = null;
     if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
     audioUrlRef.current = null;
-    window.speechSynthesis?.cancel();
     setIsPlaying(true);
-    setRevealedStep((current) => current === null || current >= index ? index - 1 : current);
+    setRevealedStep((current) => current === null ? null : (current >= index ? index : current));
     setVoiceState("thinking");
-    setVisualSegment(null);
-    setActiveTargetId(null);
 
-    const spokenNarration = formatNarrationForSpeech(segment.narration);
-    const targetPositions = computeTargetPositions(spokenNarration, segment.targetIds, getProgressiveVisibleObjects(lesson, index, true));
-    const initialTargetId = segment.targetIds[0] ?? targetPositions[0]?.targetId ?? null;
+    const spokenNarration = sanitizeNarrationForSpeech(formatNarrationForSpeech(segment.narration));
+    const targetPositions = computeTargetPositions(spokenNarration, segment.targetIds, getProgressiveVisibleObjects(lesson, index, true), lesson.connections);
+    const initialTargetId = targetPositions[0]?.targetId
+      ?? (segment.targetIds[0]?.includes("#") ? segment.targetIds[0] : null)
+      ?? segment.targetIds[0]
+      ?? null;
+    setVisualSegment({ ...segment });
+    setActiveTargetId(initialTargetId);
     const isCurrent = () => !signal.aborted && run === playbackRunRef.current;
     const beginVisualTeaching = () => {
       if (!isCurrent()) return;
@@ -634,28 +743,10 @@ export function ChalkieStudio() {
 
     try {
       let recording: Blob | null = null;
-      if (process.env.NEXT_PUBLIC_USE_GROQ_TTS === "true") {
-        const requestId = beginProviderRequest({ kind: "speech", lessonId: lesson.id, stepIndex: index });
-        try {
-          const response = await fetch("/api/speech", {
-            method: "POST", signal, headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ text: spokenNarration, sessionId }),
-          });
-          if (!isCurrent()) return;
-          const providerHeader = response.headers.get("x-chalkie-provider-status");
-          if (providerHeader) {
-            try { handleProviderStatus(JSON.parse(decodeURIComponent(providerHeader))); }
-            catch { /* ignore malformed optional status */ }
-          }
-          if (!response.ok) throw providerFailureError(await response.json().catch(() => ({})), "Voice generation failed");
-          recording = await response.blob();
-          if (!isCurrent()) return;
-          dispatchRetry({ type: "complete", requestId });
-        } catch (error) {
-          if (!isCurrent()) return;
-          failProviderRequest(requestId, error, "Voice generation failed");
-          return;
-        }
+      if (readSpeechEngine() === "local") {
+        const preferences = readAvatarVoicePreferences(avatarStyle, window.localStorage);
+        setGenerationStage("Preparing your local voice…");
+        recording = await generateLocalSpeech(spokenNarration, readLocalVoice(avatarStyle), preferences.rate, signal, message => { if (isCurrent()) setGenerationStage(message); });
       }
       if (!isCurrent()) return;
 
@@ -678,12 +769,11 @@ export function ChalkieStudio() {
       if ("speechSynthesis" in window) {
         const utterance = new SpeechSynthesisUtterance(spokenNarration);
         const voices = window.speechSynthesis.getVoices();
-        const preferredUri = window.localStorage.getItem(PREFERRED_VOICE_KEY);
-        utterance.voice = getBestAvailableVoice(voices, preferredUri);
-        const storedRate = window.localStorage.getItem(SPEECH_RATE_KEY);
-        const rate = storedRate ? parseFloat(storedRate) : DEFAULT_SPEECH_RATE;
-        utterance.rate = Number.isFinite(rate) && rate >= 0.7 && rate <= 1.3 ? rate : DEFAULT_SPEECH_RATE;
-        utterance.pitch = DEFAULT_SPEECH_PITCH;
+        const preferences = readAvatarVoicePreferences(avatarStyle, window.localStorage);
+        utterance.voice = getBestAvailableVoice(voices, preferences.uri, avatarStyle);
+        utterance.lang = utterance.voice?.lang || "en-US";
+        utterance.rate = preferences.rate;
+        utterance.pitch = preferences.pitch;
         playDeviceNarration(window.speechSynthesis, utterance, callbacks);
       } else {
         beginVisualTeaching();
@@ -700,6 +790,7 @@ export function ChalkieStudio() {
   function togglePlayback() {
     if (isPlaying) stopPlayback(true);
     else {
+      setIsTheaterMode(true);
       const run = playbackRunRef.current + 1;
       playbackRunRef.current = run;
       void playStep(activeStep, run);
@@ -904,7 +995,7 @@ export function ChalkieStudio() {
         </div>
       </header>
 
-      {showProviderBanner && (
+      {showProviderBanner && !(lesson.id === "chalkie-v2-water-cycle-demo" && !retryState.operation) && (
         <div role="alert" className="studio-provider-banner">
           <AlertTriangle size={18} className="mt-0.5 shrink-0 text-[#e9bd92]" />
           <div className="min-w-0 flex-1">
@@ -939,11 +1030,13 @@ export function ChalkieStudio() {
               <div className="studio-panel-scroll px-3">
                 {!displaySources.length && <div className="studio-empty-card"><FileText size={25} /><h3>{lesson.sources.length ? "No matching sources" : "A little context goes a long way"}</h3><p>{lesson.sources.length ? "Try a different title or publisher." : "Ask a question and the research behind your lesson will appear here."}</p></div>}
                 <div className="space-y-1">
-                  {displaySources.map((source, index) => <a key={source.id} href={source.url} target="_blank" rel="noopener noreferrer" className="studio-source" title={source.title}>
+                  {displaySources.map((source, index) => <a key={`${source.id}-${source.url || index}`} href={source.url} target="_blank" rel="noopener noreferrer" className="studio-source" title={source.title}>
                     <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[#2d3037] ${sourceColors[index % sourceColors.length]}`}>{source.url.includes("youtube") ? <Play size={15} /> : <FileText size={15} />}</span>
                     <span className="min-w-0 flex-1"><span className="line-clamp-2 break-words text-sm font-medium leading-5 text-[#e5e6e1]">{source.title}</span><span className="mt-1 block truncate text-xs text-[#a9adb6]">{source.publisher}</span></span><ArrowUpRight size={14} className="mt-1 shrink-0 text-[#838994]" />
                   </a>)}
                 </div>
+                {lesson.objects.filter(o => o.image).map(o => <div key={o.id} className="image-credit"><a href={o.image!.sourceUrl} target="_blank" rel="noopener noreferrer">{o.label} · Image source ↗</a><p>{o.image!.author}</p><a href={o.image!.licenseUrl} target="_blank" rel="noopener noreferrer">{o.image!.license}</a><span> · Shown with teaching annotations</span></div>)}
+                {lesson.objects.filter(o => o.imageRequest && o.imageRequest.status !== "ready").map(o => <div key={o.id} className="image-credit" role="status"><p>{o.label}: {o.imageRequest!.status === "not_found" ? "No suitable free image was found." : o.imageRequest!.status === "rejected" ? "The reference did not pass the image check." : "Image search or vision is temporarily unavailable."} Teaching continues with text.</p></div>)}
                 {hasLesson && <button disabled={!lesson.question || isBusy} onClick={() => void generateLesson(lesson.question)} className="studio-secondary my-4 w-full gap-2 text-xs"><RotateCcw size={14} /> Refresh research</button>}
               </div>
               <div className="studio-panel-footer">
@@ -953,51 +1046,247 @@ export function ChalkieStudio() {
             </aside>
           }
           canvas={
-            <section className="studio-canvas-panel" aria-label="Canvas workspace">
-              <div className="studio-canvas-heading">
-                <div className="flex min-w-0 items-center gap-2">
-                  {!leftPanelOpen && <button type="button" onClick={toggleLeftPanel} className="studio-icon-button studio-desktop-only" aria-label="Expand Sources sidebar"><PanelLeftOpen size={17} /></button>}
-                  <span className="text-sm font-medium">Whiteboard</span>
-                  {hasLesson && <span className="hidden truncate text-xs text-[#a9adb6] sm:inline">{isPlaying ? `Step ${activeStep + 1} of ${lesson.segments.length}` : `${lesson.segments.length} steps`}</span>}
-                </div>
-                <div className="flex shrink-0 items-center gap-1">
-                  {hasLesson && <button type="button" disabled={!!canvasError} onClick={togglePlayback} className="studio-secondary min-h-9 gap-1.5 px-3 text-xs" aria-label={isPlaying ? "Pause narration" : "Play narration"}>{isPlaying ? <Pause size={13} /> : <Play size={13} />}{isPlaying ? "Pause" : "Listen"}</button>}
-                  {!rightPanelOpen && <button type="button" onClick={toggleRightPanel} className="studio-icon-button studio-desktop-only" aria-label="Expand Lesson Guide sidebar"><PanelRightOpen size={17} /></button>}
-                </div>
-              </div>
-              <div className="studio-board" aria-busy={isGenerating}>
-                <ChalkCanvas lesson={lesson} activeSegment={isPlaying ? visualSegment : null} activeStep={activeStep} revealedStep={revealedStep} isPresenting={isPlaying} isSpeaking={voiceState === "speaking"} activeTargetId={activeTargetId} playbackRequest={playbackRequest} onPlaybackState={handleCanvasPlaybackState} />
-                {!hasLesson && !isGenerating && <div className="studio-board-empty"><div className="m-auto w-full max-w-[480px] py-6 text-center">
-                  <div className="studio-sketch" aria-hidden="true"><span /><span /><span /><svg viewBox="0 0 220 100"><path d="M55 50H85M135 50H165M110 32V16H190V50" fill="none" stroke="currentColor" strokeWidth="1.5" strokeDasharray="4 4" /></svg></div>
-                  <p className="mb-3 text-[11px] font-semibold uppercase tracking-[.18em] text-[#a9c9b0]">Make room for a new idea</p>
-                  <h1 className="text-balance text-2xl font-medium tracking-[-.035em] sm:text-3xl">See how it all connects.</h1>
-                  <p className="mx-auto mt-3 max-w-sm text-sm leading-6 text-[#a9adb6]">One question becomes a visual lesson.<br className="hidden sm:block" /> Listen, explore, and make it your own.</p>
-                  <button type="button" onClick={toggleRecording} className="studio-primary mx-auto mt-5 gap-2 px-5"><Mic size={16} /> Talk to Chalkie</button>
-                  <div className="mt-5 flex flex-wrap justify-center gap-2">
-                    {["Why do tides change?", "How does a camera focus?", "Explain supply and demand"].map((example) => <button key={example} onClick={() => void generateLesson(example)} className="studio-suggestion">{example}<ArrowUpRight size={12} /></button>)}
+            <>
+              {isTheaterMode && (
+                <div
+                  className="studio-theater-backdrop"
+                  onClick={() => setIsTheaterMode(false)}
+                  aria-hidden="true"
+                />
+              )}
+              <section className={`studio-canvas-panel ${isTheaterMode ? "is-theater" : ""}`} aria-label="Canvas workspace">
+                <div className="studio-canvas-heading">
+                  <div className="flex min-w-0 items-center gap-2">
+                    {!isTheaterMode && !leftPanelOpen && (
+                      <button type="button" onClick={toggleLeftPanel} className="studio-icon-button studio-desktop-only" aria-label="Expand Sources sidebar">
+                        <PanelLeftOpen size={17} />
+                      </button>
+                    )}
+                    <span className="text-sm font-medium">Whiteboard</span>
+                    {hasLesson && (
+                      <span className="hidden truncate text-xs text-[#a9adb6] sm:inline">
+                        {isPlaying ? `Step ${activeStep + 1} of ${lesson.segments.length}` : `${lesson.segments.length} steps`}
+                      </span>
+                    )}
+                    {isTheaterMode && hasLesson && lesson.segments[activeStep] && (
+                      <span className="truncate rounded-md bg-[#c4b5fd]/15 px-2 py-0.5 text-xs font-medium text-[#c4b5fd]">
+                        {lesson.segments[activeStep].title}
+                      </span>
+                    )}
                   </div>
-                </div></div>}
-                {isGenerating && <div className="studio-board-loading" role="status"><div className="m-auto max-w-sm p-6 text-center"><Waves className="mx-auto animate-pulse text-[#c4b5fd]" size={32} /><h2 className="mt-5 text-xl font-medium tracking-[-.03em]">Connecting the dots</h2><p className="mt-2 text-sm leading-6 text-[#a9adb6]">{generationStage}</p>{lastHeard && <p className="mt-4 line-clamp-2 text-xs italic text-[#a9adb6]">“{lastHeard}”</p>}</div></div>}
-                {isFollowUpGenerating && <div className="studio-followup" role="status"><Waves size={18} className="shrink-0 animate-pulse text-[#c4b5fd]" /><span className="min-w-0 truncate text-sm">{generationStage}</span></div>}
-              </div>
-              <div className="studio-composer">
-                {hasLesson && <div className="mb-2 flex flex-wrap gap-1" role="group" aria-label="Question mode">{(["auto", "doubt", "new"] as const).map((mode) => <button type="button" key={mode} onClick={() => setPromptMode(mode)} aria-pressed={promptMode === mode} className="studio-mode">{mode === "auto" ? <Sparkles size={12} /> : mode === "doubt" ? <MessageSquare size={12} /> : <Plus size={12} />}{mode === "auto" ? "Auto" : mode === "doubt" ? "Follow-up" : "New topic"}</button>)}</div>}
-                <form onSubmit={submitQuestion} className="studio-prompt-form">
-                  <textarea maxLength={1000} value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows={1} aria-label="Your question" placeholder={promptMode === "new" ? "What would you like to learn next?" : promptMode === "doubt" ? "Ask about this whiteboard…" : hasLesson ? "Ask a follow-up, or explore a new idea…" : "What would you like to understand?"} />
-                  <button type="button" onClick={toggleRecording} aria-label={isRecording ? "Stop recording" : "Ask with your voice"} title={isRecording ? "Stop recording" : "Ask with your voice"} className={`studio-icon-button ${isRecording ? "voice-ring bg-[#493134] text-[#f0aca9]" : "text-[#c4b5fd]"}`}><Mic size={18} /></button>
-                  <button type="submit" aria-label="Send question" title="Send question" className="studio-send" disabled={!canSubmitPrompt}>{isBusy ? <span className="h-4 w-4 animate-spin rounded-full border-2 border-[#292333]/30 border-t-[#292333]" /> : <Send size={17} />}</button>
-                </form>
-                <p className="studio-composer-hint" role="status">{isRecording ? "Listening — pause when you finish" : voiceState === "transcribing" ? "Turning your voice into a question…" : voiceState === "thinking" ? generationStage : voiceState === "speaking" ? "Chalkie is teaching · ask a question to interrupt" : "Made for curiosity. Always check important facts."}</p>
-              </div>
-            </section>
+                  <div className="flex shrink-0 items-center gap-1">
+                    {hasLesson && isTheaterMode && (
+                      <>
+                        <button
+                          type="button"
+                          disabled={activeStep <= 0}
+                          onClick={() => {
+                            const prev = activeStep - 1;
+                            const run = playbackRunRef.current + 1;
+                            playbackRunRef.current = run;
+                            setActiveStep(prev);
+                            void playStep(prev, run);
+                          }}
+                          className="studio-icon-button h-8 w-8"
+                          aria-label="Previous step"
+                          title="Previous step"
+                        >
+                          <ChevronLeft size={16} />
+                        </button>
+                        <button
+                          type="button"
+                          disabled={activeStep >= lesson.segments.length - 1}
+                          onClick={() => {
+                            const next = activeStep + 1;
+                            const run = playbackRunRef.current + 1;
+                            playbackRunRef.current = run;
+                            setActiveStep(next);
+                            void playStep(next, run);
+                          }}
+                          className="studio-icon-button h-8 w-8"
+                          aria-label="Next step"
+                          title="Next step"
+                        >
+                          <ChevronRight size={16} />
+                        </button>
+                      </>
+                    )}
+                    {hasLesson && (
+                      <button
+                        type="button"
+                        disabled={!!canvasError}
+                        onClick={togglePlayback}
+                        className="studio-secondary min-h-9 gap-1.5 px-3 text-xs"
+                        aria-label={isPlaying ? "Pause narration" : "Play narration"}
+                      >
+                        {isPlaying ? <Pause size={13} /> : <Play size={13} />}
+                        {isPlaying ? "Pause" : "Listen"}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setIsTheaterMode((prev) => !prev)}
+                      className="studio-icon-button h-8 w-8"
+                      aria-label={isTheaterMode ? "Exit theater mode (Esc)" : "Expand whiteboard to full screen"}
+                      title={isTheaterMode ? "Exit theater mode (Esc)" : "Expand whiteboard to full screen"}
+                    >
+                      {isTheaterMode ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+                    </button>
+                    {!isTheaterMode && !rightPanelOpen && (
+                      <button type="button" onClick={toggleRightPanel} className="studio-icon-button studio-desktop-only" aria-label="Expand Lesson Guide sidebar">
+                        <PanelRightOpen size={17} />
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="studio-board" aria-busy={isGenerating}>
+                  {isPlaying && voiceState === "thinking" && (
+                    <div role="status" className="absolute left-3 right-3 top-3 z-10 rounded-xl border border-[#363a40] bg-[#202327]/95 px-3 py-2 text-xs text-[#d2d4d9]">
+                      {generationStage || "Preparing narration…"}
+                    </div>
+                  )}
+                  <ChalkCanvas
+                    lesson={lesson}
+                    activeSegment={visualSegment ?? lesson.segments[activeStep] ?? null}
+                    activeStep={activeStep}
+                    revealedStep={revealedStep}
+                    isPresenting={isPlaying}
+                    isSpeaking={voiceState === "speaking"}
+                    activeTargetId={activeTargetId}
+                    playbackRequest={playbackRequest}
+                    onPlaybackState={handleCanvasPlaybackState}
+                  />
+                  {isTheaterMode && hasLesson && (
+                    <div className="studio-theater-hud" role="region" aria-label="Theater controls">
+                      <div className="studio-theater-hud-avatar" title={`Teacher ${avatarStyle}`}>
+                        <TeacherAvatar
+                          style={avatarStyle}
+                          speaking={voiceState === "speaking"}
+                          listening={isRecording}
+                          pointing={!!activeTargetId}
+                        />
+                      </div>
+                      <div className="studio-theater-hud-content min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className={`h-2 w-2 rounded-full ${voiceState === "speaking" ? "bg-[#c4b5fd] animate-pulse" : "bg-[#a9adb6]"}`} />
+                          <span className="text-[11px] font-semibold uppercase tracking-wider text-[#c4b5fd] truncate">
+                            {lesson.segments[activeStep]?.title || lesson.title}
+                          </span>
+                          {voiceState === "speaking" && (
+                            <span className="studio-theater-waveform flex items-center gap-0.5 ml-1" aria-hidden="true">
+                              <span className="w-0.5 h-2.5 bg-[#c4b5fd] rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
+                              <span className="w-0.5 h-3.5 bg-[#c4b5fd] rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
+                              <span className="w-0.5 h-2 bg-[#c4b5fd] rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+                            </span>
+                          )}
+                        </div>
+                        <p className="mt-0.5 line-clamp-2 text-xs leading-relaxed text-[#e5e7eb] sm:text-sm">
+                          {lesson.segments[activeStep]?.narration || lesson.summary}
+                        </p>
+                      </div>
+                      <div className={`studio-theater-hud-pill ${theaterInputExpanded ? "is-expanded" : ""}`}>
+                        <form
+                          onSubmit={(e) => {
+                            e.preventDefault();
+                            if (theaterPrompt.trim()) {
+                              void askFollowUp(theaterPrompt.trim());
+                              setTheaterPrompt("");
+                              setTheaterInputExpanded(false);
+                            }
+                          }}
+                          className="studio-theater-pill-form"
+                        >
+                          <button
+                            type="button"
+                            onClick={() => setTheaterInputExpanded((prev) => !prev)}
+                            className="studio-theater-pill-trigger"
+                            aria-label={theaterInputExpanded ? "Collapse follow-up input" : "Ask a follow-up doubt"}
+                            title="Ask a follow-up doubt"
+                          >
+                            <Sparkles size={14} className="text-[#c4b5fd]" />
+                          </button>
+                          <input
+                            type="text"
+                            value={theaterPrompt}
+                            onFocus={() => setTheaterInputExpanded(true)}
+                            onChange={(e) => setTheaterPrompt(e.target.value)}
+                            placeholder={theaterInputExpanded ? "Ask about this diagram…" : "Ask a follow-up…"}
+                            className="studio-theater-pill-input"
+                            maxLength={500}
+                          />
+                          {theaterInputExpanded && theaterPrompt.trim() && (
+                            <button
+                              type="submit"
+                              className="studio-theater-pill-send"
+                              aria-label="Submit follow-up"
+                            >
+                              <ArrowUpRight size={14} />
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={toggleRecording}
+                            className={`studio-theater-pill-mic ${isRecording ? "is-recording" : ""}`}
+                            aria-label={isRecording ? "Stop recording" : "Speak your doubt"}
+                            title={isRecording ? "Stop recording" : "Speak your doubt"}
+                          >
+                            <Mic size={14} />
+                          </button>
+                        </form>
+                      </div>
+                    </div>
+                  )}
+                  {!isTheaterMode && (
+                    <div className="studio-mobile-avatar">
+                      <TeacherAvatar style={avatarStyle} speaking={voiceState === "speaking"} listening={isRecording} pointing={!!activeTargetId} />
+                    </div>
+                  )}
+                  {!hasLesson && !isGenerating && (
+                    <div className="studio-board-empty">
+                      <div className="m-auto w-full max-w-[480px] py-6 text-center">
+                        <div className="studio-sketch" aria-hidden="true"><span /><span /><span /><svg viewBox="0 0 220 100"><path d="M55 50H85M135 50H165M110 32V16H190V50" fill="none" stroke="currentColor" strokeWidth="1.5" strokeDasharray="4 4" /></svg></div>
+                        <p className="mb-3 text-[11px] font-semibold uppercase tracking-[.18em] text-[#a9c9b0]">Make room for a new idea</p>
+                        <h1 className="text-balance text-2xl font-medium tracking-[-.035em] sm:text-3xl">See how it all connects.</h1>
+                        <p className="mx-auto mt-3 max-w-sm text-sm leading-6 text-[#a9adb6]">One question becomes a visual lesson.<br className="hidden sm:block" /> Listen, explore, and make it your own.</p>
+                        <button type="button" onClick={toggleRecording} className="studio-primary mx-auto mt-5 gap-2 px-5"><Mic size={16} /> Talk to Chalkie</button>
+                        <div className="mt-5 flex flex-wrap justify-center gap-2">
+                          {["Why do tides change?", "How does a camera focus?", "Explain supply and demand"].map((example) => <button key={example} onClick={() => void generateLesson(example)} className="studio-suggestion">{example}<ArrowUpRight size={12} /></button>)}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  {isGenerating && (
+                    <div className="studio-board-loading" role="status">
+                      <div className="m-auto max-w-sm p-6 text-center"><Waves className="mx-auto animate-pulse text-[#c4b5fd]" size={32} /><h2 className="mt-5 text-xl font-medium tracking-[-.03em]">Connecting the dots</h2><p className="mt-2 text-sm leading-6 text-[#a9adb6]">{generationStage}</p>{lastHeard && <p className="mt-4 line-clamp-2 text-xs italic text-[#a9adb6]">“{lastHeard}”</p>}</div>
+                    </div>
+                  )}
+                  {isFollowUpGenerating && (
+                    <div className="studio-followup" role="status">
+                      <Waves size={18} className="shrink-0 animate-pulse text-[#c4b5fd]" /><span className="min-w-0 truncate text-sm">{generationStage}</span>
+                    </div>
+                  )}
+                </div>
+                {!isTheaterMode && (
+                  <div className="studio-composer">
+                    {hasLesson && <div className="mb-2 flex flex-wrap gap-1" role="group" aria-label="Question mode">{(["auto", "doubt", "new"] as const).map((mode) => <button type="button" key={mode} onClick={() => setPromptMode(mode)} aria-pressed={promptMode === mode} className="studio-mode">{mode === "auto" ? <Sparkles size={12} /> : mode === "doubt" ? <MessageSquare size={12} /> : <Plus size={12} />}{mode === "auto" ? "Auto" : mode === "doubt" ? "Follow-up" : "New topic"}</button>)}</div>}
+                    <form onSubmit={submitQuestion} className="studio-prompt-form">
+                      <textarea maxLength={1000} value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} rows={1} aria-label="Your question" placeholder={promptMode === "new" ? "What would you like to learn next?" : promptMode === "doubt" ? "Ask about this whiteboard…" : hasLesson ? "Ask a follow-up, or explore a new idea…" : "What would you like to understand?"} />
+                      <button type="button" onClick={toggleRecording} aria-label={isRecording ? "Stop recording" : "Ask with your voice"} title={isRecording ? "Stop recording" : "Ask with your voice"} className={`studio-icon-button ${isRecording ? "voice-ring bg-[#493134] text-[#f0aca9]" : "text-[#c4b5fd]"}`}><Mic size={18} /></button>
+                      <button type="submit" aria-label="Send question" title="Send question" className="studio-send" disabled={!canSubmitPrompt}>{isBusy ? <span className="h-4 w-4 animate-spin rounded-full border-2 border-[#292333]/30 border-t-[#292333]" /> : <Send size={17} />}</button>
+                    </form>
+                    <p className="studio-composer-hint" role="status">{isRecording ? "Listening — pause when you finish" : voiceState === "transcribing" ? "Turning your voice into a question…" : voiceState === "thinking" ? generationStage : voiceState === "speaking" ? "Chalkie is teaching · ask a question to interrupt" : "Made for curiosity. Always check important facts."}</p>
+                  </div>
+                )}
+              </section>
+            </>
           }
           guide={
             <aside className="studio-panel" aria-label="Lesson guide">
               <div className="studio-panel-heading"><h2><BookOpen size={17} /> Lesson guide</h2><button type="button" onClick={toggleRightPanel} className="studio-icon-button studio-desktop-only" aria-label="Collapse Lesson Guide sidebar"><PanelRightClose size={17} /></button></div>
               <div className="studio-panel-scroll px-4">
                 <div className="studio-voice-card">
-                  <div className="flex flex-wrap items-center justify-between gap-2"><span className="flex items-center gap-2 text-xs font-medium text-[#d4c8f2]"><Headphones size={15} /> Listen & learn</span><button type="button" onClick={() => setVoiceSettingsOpen(true)} className="studio-icon-button h-8 min-h-8 w-8 text-[#d4c8f2]" aria-label="Voice settings" title="Voice settings"><SlidersHorizontal size={16} /></button></div>
-                  <h3 className="mt-4 break-words text-lg font-medium leading-6 tracking-[-.02em]">{hasLesson ? lesson.title : "A lesson, at your pace"}</h3>
+                  <div className="flex flex-wrap items-center justify-between gap-2"><span className="flex items-center gap-2 text-xs font-medium text-[#d4c8f2]"><Headphones size={15} /> Listen & learn</span><button type="button" onClick={() => { stopPlayback(false); setVoiceSettingsOpen(true); }} className="studio-icon-button h-8 min-h-8 w-8 text-[#d4c8f2]" aria-label="Voice settings" title="Voice settings"><SlidersHorizontal size={16} /></button></div>
+                  <TeacherAvatar style={avatarStyle} speaking={voiceState === "speaking"} listening={isRecording} pointing={!!activeTargetId} className="teacher-in-guide" /><h3 className="mt-4 break-words text-lg font-medium leading-6 tracking-[-.02em]">{hasLesson ? lesson.title : "A lesson, at your pace"}</h3>
                   <p className="mt-2 line-clamp-3 text-xs leading-5 text-[#b8b3c3]">{lastAnswer || (hasLesson ? lesson.visualStrategy : "Follow along as your ideas take shape on the whiteboard.")}</p>
                   <div className="mt-5 flex items-center gap-3">
                     <button disabled={!hasLesson || !!canvasError} onClick={togglePlayback} aria-label={isPlaying ? "Pause lesson" : "Play lesson"} className="studio-send h-11 w-11">{isPlaying ? <Pause size={17} fill="currentColor" /> : <Play size={17} fill="currentColor" />}</button>
@@ -1008,7 +1297,7 @@ export function ChalkieStudio() {
                 {!hasLesson && <div className="studio-empty-card"><Waves size={25} /><h3>Your path to understanding</h3><p>Each lesson is broken into steps you can revisit anytime.</p></div>}
                 <div className="space-y-2 pb-5">{lesson.segments.map((step, index) => {
                   const state = index < activeStep ? "done" : index === activeStep ? "active" : "next";
-                  return <button key={step.id} disabled={!!canvasError} onClick={() => { const run = playbackRunRef.current + 1; playbackRunRef.current = run; setActiveStep(index); void playStep(index, run); }} aria-label={`Teach ${step.title}`} aria-current={state === "active" ? "step" : undefined} className="studio-step">
+                  return <button key={step.id} disabled={!!canvasError} onClick={() => { setIsTheaterMode(true); const run = playbackRunRef.current + 1; playbackRunRef.current = run; setActiveStep(index); void playStep(index, run); }} aria-label={`Teach ${step.title}`} aria-current={state === "active" ? "step" : undefined} className="studio-step">
                     <span className={`studio-step-number ${state === "done" ? "bg-[#303d36] text-[#a9c9b0]" : state === "active" ? "bg-[#c4b5fd] text-[#292333]" : "bg-[#30343a] text-[#a9adb6]"}`}>{state === "done" ? <Check size={13} /> : String(index + 1).padStart(2, "0")}</span>
                     <span className="min-w-0"><span className="block break-words text-sm font-medium leading-5">{step.title}</span><span className="mt-1.5 line-clamp-2 break-words text-xs leading-5 text-[#a9adb6]">{step.narration}</span></span>
                   </button>;

@@ -12,6 +12,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    "public/speech-runtime/**",
+    "scratch/**",
+    "scripts/**",
   ]),
   {
     files: ["components/ui/**/*.{ts,tsx}", "hooks/use-mobile.ts"],
@@ -21,6 +24,12 @@ const eslintConfig = defineConfig([
       "@typescript-eslint/no-unused-vars": "off",
       "react-hooks/purity": "off",
       "react-hooks/set-state-in-effect": "off",
+    },
+  },
+  {
+    files: ["components/canvas-templates/**/*.{ts,tsx}"],
+    rules: {
+      "react-hooks/preserve-manual-memoization": "off",
     },
   },
 ]);
