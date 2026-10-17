@@ -107,6 +107,27 @@ test("normalizedRegionBoxSchema rejects out-of-bounds coordinates", () => {
   });
 });
 
+test("scientificGraphPlotPlanSchema validates legitimate Route D graph plan", () => {
+  const raw = {
+    action: "scientific_graph_plot",
+    rationale: "Comparing normal damped oscillation wave against resonant amplification curve",
+    graphTitle: "Damped vs Resonant Wave Comparison",
+    graphType: "wave-comparison",
+    xAxisLabel: "Time (s)",
+    yAxisLabel: "Amplitude / Displacement",
+    seriesSpec: "Damped Wave: exp(-0.25*x)*cos(3*x) | #38bdf8; Resonant Amplification: 0.18*x*cos(3*x) | #f43f5e",
+    teachingMode: "comparison",
+  };
+  const parsed = visualAgentDecisionSchema.parse(raw);
+  assert.equal(parsed.action, "scientific_graph_plot");
+  if (parsed.action === "scientific_graph_plot") {
+    assert.equal(parsed.graphType, "wave-comparison");
+    assert.equal(parsed.xAxisLabel, "Time (s)");
+    assert.equal(parsed.yAxisLabel, "Amplitude / Displacement");
+    assert.ok(parsed.seriesSpec.includes("Damped Wave"));
+  }
+});
+
 test("visualAgentDecisionJsonSchema adheres to Groq strict schema format", () => {
   const schema = visualAgentDecisionJsonSchema;
   assert.equal(schema.schema.type, "object");
@@ -116,4 +137,7 @@ test("visualAgentDecisionJsonSchema adheres to Groq strict schema format", () =>
   assert.ok(Array.isArray(schema.schema.required));
   assert.ok(schema.schema.required.includes("action"));
   assert.ok(schema.schema.required.includes("rationale"));
+  assert.ok(schema.schema.required.includes("graphType"));
+  assert.ok(schema.schema.required.includes("seriesSpec"));
 });
+

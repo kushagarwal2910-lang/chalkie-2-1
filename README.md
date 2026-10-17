@@ -1,9 +1,6 @@
 # Chalkie 2.0
 
-Chalkie's original Next.js interface and browser narration, with Excalidraw, free Commons/Openverse reference images, Groq image understanding, and an animated local teacher.
-
-> 📖 **Deep Technical Specification**: For an exhaustive, end-to-end breakdown of the entire architecture, data schemas, visual grounding pipeline, spatial layout algorithms, and concrete examples, see **[SCHEMAS.md](file:///c:/Users/agarw/OneDrive/Desktop/kush/chalkie%202.0/SCHEMAS.md)**.
-
+Visual lessons with Excalidraw, retrieved diagrams, deterministic graphs, document sources, and speech-linked teaching gestures.
 
 ## Run
 
@@ -14,50 +11,77 @@ npm ci
 npm run dev
 ```
 
-Open http://localhost:3000. Add your Groq and Tavily keys in the existing provider settings. Server-side `GROQ_API_KEY` and `TAVILY_API_KEY` are also supported by the original credential system. Live lessons require research; the labeled sample still works without keys. No tldraw license is required.
+Open http://localhost:3000. The sample at `/studio?demo=1`, local graphs, document parsing, and device voices work without provider accounts. Try **Plot y=x^2 from -5 to 5** or **Chart January: 12, February: 18, March: 9** for a fully local graph lesson.
 
-For production, configure a persistent `BYOK_ENCRYPTION_SECRET` of at least 32 characters to enable saving provider keys securely. Development generates its own ignored local secret.
+General lesson planning, image inspection, and multilingual narration text use the existing Groq credentials. Live web research additionally uses Tavily. Add those keys in provider settings or configure `GROQ_API_KEY` and `TAVILY_API_KEY` on the server. Uploaded materials with **Include Web Search** off do not require Tavily. No new image or speech provider is required for these features.
 
-- `/avatars`: three original teacher options, local natural/device voice preview, and link to a sample lesson.
-- `/studio?demo=1`: a clearly labeled water-cycle sample, usable without API keys.
-- Voice settings in the lesson guide select the avatar, voice, pace, and pitch. Each avatar remembers separate preferences; Mira prefers known feminine voices and Arjun known masculine voices. Explicit voice choices override these defaults.
+For production, set a persistent `BYOK_ENCRYPTION_SECRET` of at least 32 characters to save provider keys securely. Development generates an ignored local secret. No service is deployed by this change.
 
-Device speech is the lightweight default. Select **Local natural** in Teacher & voice for free Kokoro English voices. No speech API key, account, or per-call fee is needed. First use downloads about 120 MB of model/runtime data; browser caches retain model/voice files when available. Inference runs in a Web Worker on the user’s CPU, so latency and memory depend on the device. Audio reuse is bounded to 12 recordings/12 MB. Local voice latency remains higher than device speech; further streaming optimization is deferred while lesson/image quality is prioritized. Cancelling generation terminates its worker. The retired `/api/speech` endpoint returns 410 and never calls Groq. Lesson planning and vision continue using the fixed Groq models.
+## Visual selection and graphs
 
-The avatar follows speech start/end, receives browser word-boundary cues or approximate local-audio pointer timing, blinks, and gestures locally. Mouth movements approximate speaking; they are not phoneme-accurate lip sync. Device voices differ by browser and OS. Reduced-motion settings disable decorative breathing and gestures.
+- Anatomy, biology, chemistry, hardware, and geography first use diagrams from the user's supplied documents, then Commons/Openverse. Vision checks suitability before a public reference is displayed. Attribution and permitted license metadata remain attached.
+- Stories, real-world cases, and physical analogies request generated conceptual illustrations. Canonical searches can also fall back to generation when retrieval finds no suitable match. Without an image provider or local model, Chalkie uses the remaining board and shows the reason in Sources. Generated images are labeled as illustrations, never documentary evidence.
+- Numerical data, curves, force vectors, and timelines use `lib/plot-tool.ts`, a deterministic TypeScript SVG compiler. It supports bar, line, scatter, curve, force, and timeline specifications. ELK handles causal chains and flowcharts. The renderer makes no AI or external API calls.
 
-## Architecture
+General-language requests still use the planner to select a plot and structure its data. Explicit supported formulas and label/value pairs bypass the planner entirely. Arithmetic expressions use a restricted parser, never JavaScript evaluation. Numerical graphs preserve their data, units, provenance, and source IDs. The planner must use supplied evidence for measured data; hypothetical values are labeled illustrative. Source identity is validated, but semantic accuracy of model-extracted values still needs review.
 
-The existing Tavily retrieval, Groq quota/key management, transcription endpoint, IndexedDB lessons, and optional Drive backup are retained. `lib/lesson-v2.ts` defines a compact model output and compiles it into the existing lesson structure with version 2. Layout runs once on generation. `components/chalk-canvas.tsx` adapts that structure to Excalidraw and follows narration target IDs.
+## Documents and research
 
-The planner chooses a teaching mode for each question: a reference image with handwritten notes, a meaningful sequence, paired comparisons, a worked example, or a concise concept explanation. It has no minimum quota of boxes or steps. Reference lessons introduce the image immediately and keep it visible as notes are added. `lib/teaching-layout.ts` arranges these compositions; ELK handles genuine sequences. Narration cues move the pointer without repeatedly zooming the camera. Follow-ups use the same planner and image tool, answering in one or two steps. New images and their layout are appended without moving the existing board.
+Expand **Lesson sources & documents** in Sources to import PDFs, DOCX, TXT, Markdown, CSV/TSV, public URLs, raw text, or available YouTube transcripts. Turn **Include Web Search** off to use only supplied material. Blocked YouTube transcripts can be pasted manually.
 
-Live generation requires nonempty retrieved evidence. Missing credentials, failed searches, or empty results produce a research error instead of silently switching to general knowledge. The text prompt requires factual claims to use the supplied passages and acknowledge gaps. This is a grounding constraint, not a guarantee that every model claim is correct. Follow-ups reuse session retrieval or saved source summaries, and fail clearly if neither contains evidence. Follow-ups never call Tavily; start a new topic to research a different subject. Source metadata persists with follow-ups. Invalid structured output gets one bounded retry using the same model.
+PDF/DOCX parsing runs in the browser. PDFs retain readable text plus embedded images and rendered diagram pages; remove unwanted diagram previews before asking. Limits: eight sources, 20 MB per file, first 40 PDF pages, 100,000 text characters per source, and eight diagrams total. Scanned PDFs can use bounded vision transcription of up to two retained pages per source, four total. Unreadable scans produce a clear evidence error instead of fabricated text.
 
-`lib/models.ts` fixes all text planning and follow-ups to `openai/gpt-oss-120b` and vision to `qwen/qwen3.8-27b`, both on Groq. These IDs cannot be overridden by environment variables. `lib/image-library.ts` selects up to two free images per request, including follow-ups, through independent Commons and Openverse adapters and uses vision to check suitability and suggest approximate normalized regions. This uses the same Groq credentials as teaching. Image failures fall back to text and show a reason in Sources. Selected images still use Groq inference when analyzed; the image library itself has no license purchase fee. Configure `GROQ_API_KEY_2` for the existing automatic key failover.
+User chunks enter the existing lexical/semantic retrieval pool with priority and source score `1.0`. This indicates user priority, not factual certification. Public URL imports validate DNS addresses and redirects, pin the public address, and enforce type, size, and time limits. Private-network URLs are rejected.
 
-Only explicitly allowed CC0, public domain, CC BY, and CC BY-SA assets are accepted. Attribution and original/license links appear in Sources and remain in exported lesson metadata. Image binaries are cached separately in IndexedDB; exports/Drive backups retain image references, not an offline image bundle. Cropped images fall back to whole-image focus. Scene edits persist locally.
+Materials persist per lesson in IndexedDB and restore when reopening that lesson. Imported text and selected diagrams are sent to configured teaching providers when generating an explanation. User diagrams and generated images are not placed in the shared public-image cache. The research index remains process-local; multi-instance deployment needs shared storage. Existing Drive backup is retained, but source-document storage is device-local.
 
-Vision regions are approximate model predictions, not verified anatomical boundaries. The cache is bounded, process-local, and lasts 24 hours. Existing RAG indexes remain process-local; horizontal production deployment requires shared storage. Existing v1 custom scientific drawings render as labeled nodes in v2; the original renderer is removed.
+## Teaching focus, camera, and speech
 
-For steps involving an image, a compact final narration pass uses the same text model with the retrieved evidence and the actual vision description/regions. Unlocated parts must not be described as visibly highlighted, and failed images must not be referred to as present. This adds a text call only for image-related explanations. If this pass fails, the request fails rather than playing a draft that assumed a different image.
+Narration is finalized after images and graphs exist. The model receives their actual region IDs, descriptions, graph values, axes, units, and research evidence. Each cue quotes a phrase in the spoken narration and names a validated target. Unknown targets and unsupported arrows are discarded.
+
+The camera follows the active object or image region. Whole images occupy roughly 70% of the available viewport; inspected subregions use a bounded close-up. Cards receive their own framing. Manual panning/zooming suspends following until **Follow teacher camera** is selected. Reduced-motion preferences are respected.
+
+Circles, brackets, and curved dashed chalk arrows appear at spoken cues. Intra-image arrows require two located regions in the same image. Overlays follow the live Excalidraw position, scale, rotation, and flip. Image regions remain approximate vision predictions; missing or uncertain geometry does not get an invented pointer location. Graph targets come directly from the renderer's geometry.
+
+Timing uses device word boundaries or provider alignment when available. Engines without alignment speak bounded phrase chunks so explicit gestures begin with actual phrase audio rather than estimated character timing. The avatar's mouth movement is approximate, not phoneme-level lip synchronization.
+
+## Languages and voices
+
+The Guide offers **Native mode** (board and narration in the selected language) and **Classroom mode** (English labels and scientific terms with conversational regional narration, including Hinglish, Tanglish, and Teluglish). Stable object IDs, formulas, numeric data, and units stay unchanged. Saved segments retain their own language when a later follow-up uses a different setting.
+
+**Local natural** is the English default: Kokoro runs in a Web Worker without an account or per-call fee. First use downloads about 120 MB; browser caches retain available model assets. **Device voice** avoids the download and uses an installed voice matching the narration language. If no matching regional voice exists, the UI explains how to add one and keeps captions available. It does not substitute an English voice for regional text.
+
+Optional server-side providers:
+
+```dotenv
+# Optional image generation: choose a hosted provider OR an existing local server.
+FAL_KEY=your-key
+CHALKIE_IMAGE_MODEL=z-image-turbo
+# Alternative: CHALKIE_IMAGE_MODEL=flux-schnell
+# LOCAL_IMAGE_ENDPOINT=http://127.0.0.1:8188/your-compatible-endpoint
+
+# Optional Indian-language speech.
+SARVAM_API_KEY=your-key
+SARVAM_SPEAKER=shubh
+
+# Optional multilingual speech with alignment.
+ELEVENLABS_API_KEY=your-key
+ELEVENLABS_VOICE_ID=your-voice-id
+```
+
+The local image endpoint must already be running and accept the adapter's fal-compatible JSON request, returning an `images` array with inline raster `url` data. Chalkie does not install or start an image model. Hosted generation supports [Z-Image Turbo](https://fal.ai/models/fal-ai/z-image/turbo/api) and [FLUX Schnell](https://fal.ai/models/fal-ai/flux/schnell/api); speech supports Sarvam Bulbul v3 and ElevenLabs Flash v2.5. Secrets stay on the server. Gemini TTS is not integrated. Cloud speech returns bounded phrase audio, not a continuous streaming transport. Actual latency depends on the provider, hardware, and network; 1.5-second image generation and 75-millisecond speech are not guaranteed.
 
 ## Validation
 
 ```sh
 npm run typecheck
 node --experimental-strip-types --test lib/*.test.ts scratch/test-playback-sync.mjs
+node --experimental-strip-types scripts/test-source-ingestion.mjs
+node --experimental-strip-types scripts/test-document-parsers.mjs
+node --experimental-strip-types scripts/test-grounded-narration.mjs
 npm run build
 ```
 
-The build includes the original stylesheet verification. Excalidraw fonts are copied locally by postinstall. The existing Docker and Render setups use the npm lockfile. No service has been deployed and no changes have been pushed to the original repository.
+Tests use fixtures and mocked providers. Document tests exercise real DOCX extraction and PDF text/vector rendering. The build copies PDF and speech runtime assets and verifies compiled styles. Excalidraw fonts are copied by postinstall. `npm run dev:next -- --webpack` is available when the local Turbopack process cannot start; the custom server remains the default for WebSocket status updates.
 
-For an opt-in live smoke test, run the app with real keys, set `RUN_LIVE_TESTS=1`, then run `node scripts/test-live-research.mjs`. It supplies only fresh questions and checks research, model configuration, images, and follow-ups. It consumes provider quota and writes actual responses to the ignored `outputs/research-live/` directory. These checks validate the integration, not every factual claim or predicted image boundary.
-
-The independent image providers are [Wikimedia Commons](https://commons.wikimedia.org/wiki/Commons:API/MediaWiki) and [Openverse](https://docs.openverse.org/packages/js/api_client/index.html). Search is keyless; only CC0, public domain, CC BY and CC BY-SA results pass the filter. Credits remain attached. Search/vision may still reject a reference or find nothing. Run `RUN_LIVE_TESTS=1 node scripts/test-followup-images.mjs` after the research test to check real image downloads and a new-image follow-up with an invalid Tavily test key.
-
-Local speech uses [Kokoro.js](https://github.com/hexgrad/kokoro/tree/main/kokoro.js) and its Apache-licensed weights. Runtime assets are copied on install/build; notices are included. Device voices require no model download.
-
-Research strips separate image-presentation instructions from the subject query, filters stock-image/social/homework listings, prioritizes educational/institutional domains, and selects relevant bounded excerpts across sources. Image inspection requires English labels or a clear unlabeled reference. Search tries bounded alternative candidates and a broader query when presentation qualifiers hide useful results; uncertain regions are omitted.
-
-Run `RUN_LIVE_TESTS=1 node scripts/test-teaching-live.mjs` to check that real questions select comparison and worked-example layouts using retrieved evidence.
+Existing live checks (`scripts/test-live-research.mjs`, `scripts/test-followup-images.mjs`, `scripts/test-teaching-live.mjs`) are opt-in through `RUN_LIVE_TESTS=1` and consume provider quota. New hosted image/voice adapters have offline contract tests; no latency or naturalness claims are established by those tests.

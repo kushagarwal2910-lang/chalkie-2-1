@@ -41,6 +41,10 @@ self.onmessage = ({ data }) => {
         if (!response.ok) throw new Error("Voice download failed");
         await voiceCache.put(voiceUrl, response);
       }
+      if (data.warmup) {
+        self.postMessage({ id, type: "warmup-complete" });
+        return;
+      }
       const chunks = [];
       let sampleRate = 24000;
       // Bound each utterance below the model's 510-phoneme context limit.

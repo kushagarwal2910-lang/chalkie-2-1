@@ -1,6 +1,7 @@
 import type { LessonPlan, VisualPart } from "./lesson-schema";
 import { formatMathFormula } from "./math-formatter.ts";
 import { getVisualFootprint } from "./visual-footprint.ts";
+import { resolveTeachingTarget } from "./teaching-focus.ts";
 
 export const BACKDROP_ROLES = new Set(["environment", "container", "layer", "field", "path"]);
 
@@ -759,18 +760,50 @@ export function normalizeLessonLayout(rawPlan: LessonPlan): LessonPlan {
     }];
   });
   const validTargets = new Set([...objectIds, ...connections.map((connection) => connection.id)]);
+  const annotationMaps = new Map<string, Map<string, string>>();
+  const annotationOwners = new Map<string, string[]>();
+  for (const object of objects) {
+    const annotations = new Map<string, string>();
+    object.annotations = object.annotations?.map(annotation => {
+      const id = allocateId(annotation.id, `ann-${object.id}`);
+      annotations.set(annotation.id, id);
+      annotationOwners.set(annotation.id, [...(annotationOwners.get(annotation.id) ?? []), object.id]);
+      return { ...annotation, id, targetImageId: object.id };
+    });
+    annotationMaps.set(object.id, annotations);
+  }
+  const mapTarget = (target: string): string | null => {
+    const [base, part] = target.split("#");
+    const mapped = idMap.get(base) ?? base;
+    if (validTargets.has(mapped)) {
+      const mappedPart = part === undefined ? undefined : annotationMaps.get(mapped)?.get(part) ?? part;
+      return mappedPart === undefined ? mapped : `${mapped}#${mappedPart}`;
+    }
+    const owners = annotationOwners.get(base);
+    if (part === undefined && owners?.length === 1) return `${owners[0]}#${annotationMaps.get(owners[0])!.get(base)}`;
+    return null;
+  };
   const fallbackId = objects[0]?.id;
   const segments = plan.segments.map((segment, index) => {
-    const targetIds = [...new Set(segment.targetIds.map((id) => {
-      const [base, part] = id.split("#");
-      const mapped = idMap.get(base) ?? base;
-      return part === undefined ? mapped : `${mapped}#${part}`;
-    }).filter((id) => validTargets.has(id.split("#")[0])))];
+    const targetIds = [...new Set(segment.targetIds.map(mapTarget).filter((target): target is string => target !== null))];
+    const narration = segment.narration.replace(/[<>]/g, "").slice(0, 2400);
+    const cues = segment.cues?.flatMap(cue => {
+      const targetId = mapTarget(cue.targetId);
+      const toTargetId = cue.toTargetId ? mapTarget(cue.toTargetId) : undefined;
+      const phrase = cue.phrase.replace(/[<>]/g, "");
+      if (!targetId || !phrase || !narration.includes(phrase) || (cue.toTargetId && !toTargetId)) return [];
+      const from = resolveTeachingTarget(targetId, objects, connections);
+      const to = toTargetId ? resolveTeachingTarget(toTargetId, objects, connections) : undefined;
+      if (!from || (cue.toTargetId && !to)) return [];
+      if (cue.kind === "arrow" && (from.kind !== "region" || to?.kind !== "region" || from.objectId !== to.objectId)) return [];
+      return [{ ...cue, phrase, targetId, toTargetId: toTargetId ?? undefined }];
+    });
     return {
       ...segment,
+      cues,
       id: safeId(segment.id, `segment-${index + 1}`),
       title: segment.title.replace(/[<>]/g, "").slice(0, 80),
-      narration: segment.narration.replace(/[<>]/g, "").slice(0, 2400),
+      narration,
       durationMs: clamp(segment.durationMs, 1200, 45000),
       targetIds: targetIds.length ? targetIds : fallbackId ? [fallbackId] : [],
     };

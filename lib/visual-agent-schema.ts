@@ -79,11 +79,23 @@ export const canvasConceptFocusPlanSchema = z.object({
 });
 export type CanvasConceptFocusPlan = z.infer<typeof canvasConceptFocusPlanSchema>;
 
+// Route D: Plot scientific graph/wave beside existing board
+export const scientificGraphPlotPlanSchema = z.object({
+  action: z.literal("scientific_graph_plot"),
+  rationale: z.string().max(300).describe("Why a scientific graph or mathematical plot is required"),
+  graphType: z.enum(["function-plot", "wave-comparison", "bar-chart", "line-chart"]).default("wave-comparison"),
+  xAxisLabel: z.string().max(80).default("Time (s)"),
+  yAxisLabel: z.string().max(80).default("Amplitude / Displacement"),
+  seriesSpec: z.string().max(500).default("Damped Wave: exp(-0.25*x)*cos(3*x) | #38bdf8; Resonant Amplification: 0.18*x*cos(3*x) | #f43f5e"),
+});
+export type ScientificGraphPlotPlan = z.infer<typeof scientificGraphPlotPlanSchema>;
+
 // Unified Discriminated Union for Agent Decision
 export const visualAgentDecisionSchema = z.discriminatedUnion("action", [
   inPlaceAnnotationPlanSchema,
   openLibrarySearchPlanSchema,
   canvasConceptFocusPlanSchema,
+  scientificGraphPlotPlanSchema,
 ]);
 export type VisualAgentDecision = z.infer<typeof visualAgentDecisionSchema>;
 
@@ -112,11 +124,16 @@ export const visualAgentDecisionJsonSchema = {
   schema: {
     type: "object",
     additionalProperties: false,
-    required: ["action", "rationale", "targetImageId", "targetFeatureQuery", "shadingColor", "drawStyle", "calloutLabel", "imageQuery", "regionsToLocate", "teachingMode", "targetObjectIds"],
+    required: [
+      "action", "rationale", "targetImageId", "targetFeatureQuery",
+      "shadingColor", "drawStyle", "calloutLabel", "imageQuery",
+      "regionsToLocate", "teachingMode", "targetObjectIds",
+      "graphType", "xAxisLabel", "yAxisLabel", "seriesSpec"
+    ],
     properties: {
       action: {
         type: "string",
-        enum: ["in_place_image_annotation", "open_library_search", "canvas_concept_focus"],
+        enum: ["in_place_image_annotation", "open_library_search", "canvas_concept_focus", "scientific_graph_plot"],
         description: "The autonomous route selected by the visual agent",
       },
       rationale: { type: "string", description: "Pedagogical justification for this route" },
@@ -129,6 +146,10 @@ export const visualAgentDecisionJsonSchema = {
       regionsToLocate: { type: "array", items: { type: "string" }, description: "Regions to locate for open_library_search" },
       teachingMode: { type: "string", enum: ["reference", "sequence", "comparison", "worked-example", "concept"] },
       targetObjectIds: { type: "array", items: { type: "string" }, description: "Target object IDs for canvas_concept_focus" },
+      graphType: { type: "string", description: "Type of graph (e.g. wave-comparison, function-plot, bar-chart, line-chart; empty if other route)" },
+      xAxisLabel: { type: "string", description: "Label for horizontal X axis (empty string if other route)" },
+      yAxisLabel: { type: "string", description: "Label for vertical Y axis (empty string if other route)" },
+      seriesSpec: { type: "string", description: "Mathematical DSL or preset for curves (empty string if other route)" },
     },
   },
 };

@@ -1,12 +1,13 @@
 import crypto from "node:crypto";
 import type { ResearchSource } from "@/lib/lesson-schema";
 import type { GroqCallOptions } from "@/lib/groq-pool";
-import { resolveProviderCredentials } from "@/lib/provider-credentials";
-import { ResearchError, requireResearchEvidence } from "./research-evidence";
-import { relevantExcerpt, researchQuery, sourceAuthority, usableEvidenceUrl } from "./research-quality";
+import { resolveProviderCredentials } from "./provider-credentials.ts";
+import { ResearchError, requireResearchEvidence } from "./research-evidence.ts";
+import { relevantExcerpt, researchQuery, sourceAuthority, usableEvidenceUrl } from "./research-quality.ts";
+import { isUserSourceUrl, sourceEvidenceText, sourceMaterialsSchema, sourceMaterialUrl, type SourceResearchOptions } from "./source-materials.ts";
 
 type TavilyResult = { title?: string; url?: string; content?: string; raw_content?: string; score?: number };
-type ResearchChunk = { id: string; sourceId: string; title: string; url: string; text: string; lexical: number; semantic: number; score: number };
+type ResearchChunk = { id: string; sourceId: string; title: string; url: string; text: string; lexical: number; semantic: number; score: number; userProvided?: boolean };
 type ResearchIndex = { question: string; sources: ResearchSource[]; chunks: ResearchChunk[]; indexedAt: number };
 
 declare global {
@@ -19,16 +20,16 @@ globalThis.chalkieResearchIndexes = researchIndexes;
 const stopWords = new Set(["the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "is", "are", "how", "what", "why"]);
 
 function tokens(text: string): string[] {
-  return text.toLowerCase().match(/[a-z0-9]{2,}/g)?.filter((token) => !stopWords.has(token)) ?? [];
+  return text.toLowerCase().match(/[\p{L}\p{M}\p{N}]{2,}/gu)?.filter((token) => !stopWords.has(token)) ?? [];
 }
 
-function chunkText(text: string, maxChars = 1800): string[] {
-  const clean = text.replace(/\s+/g, " ").trim().slice(0, 28000);
+function chunkText(text: string, maxChars = 1800, limit = 12): string[] {
+  const clean = text.replace(/\s+/g, " ").trim().slice(0, limit * (maxChars - 250));
   if (!clean) return [];
   const chunks: string[] = [];
   for (let cursor = 0; cursor < clean.length; cursor += maxChars - 250) {
     chunks.push(clean.slice(cursor, cursor + maxChars));
-    if (chunks.length >= 12) break;
+    if (chunks.length >= limit) break;
   }
   return chunks;
 }
@@ -84,32 +85,51 @@ function indexKey(sessionId: string) {
 
 async function rankChunks(question: string, chunks: ResearchChunk[], groqOptions: GroqCallOptions = {}): Promise<ResearchChunk[]> {
   groqOptions.signal?.throwIfAborted();
-  const rescored = chunks.filter(chunk => usableEvidenceUrl(chunk.url)).map((chunk) => {
+  const authority = (chunk: ResearchChunk) => chunk.userProvided ? 1 : sourceAuthority(chunk.url);
+  const rescored = chunks.filter(chunk => chunk.userProvided || isUserSourceUrl(chunk.url) || usableEvidenceUrl(chunk.url)).map((chunk) => {
     const text = relevantExcerpt(researchQuery(question), chunk.text);
     return { ...chunk, text, lexical: lexicalScore(researchQuery(question), text), semantic: 0, score: 0 };
   });
-  const candidatePool = rescored.sort((a, b) => (b.lexical + sourceAuthority(b.url) * 0.2) - (a.lexical + sourceAuthority(a.url) * 0.2)).slice(0, 30);
+  const priority = (chunk: ResearchChunk) => authority(chunk) * 0.2 + (chunk.userProvided ? 0.35 : 0);
+  const candidatePool = rescored.sort((a, b) => (b.lexical + priority(b)) - (a.lexical + priority(a))).slice(0, 30);
   const vectors = await embeddings([question, ...candidatePool.map((chunk) => chunk.text)], groqOptions.signal);
   if (vectors?.length === candidatePool.length + 1) {
     const queryVector = vectors[0];
     candidatePool.forEach((chunk, index) => { chunk.semantic = Math.max(0, cosine(queryVector, vectors[index + 1])); });
   }
-  candidatePool.forEach((chunk) => { chunk.score = (vectors ? (chunk.semantic * 0.62 + chunk.lexical * 0.38) : chunk.lexical) + sourceAuthority(chunk.url) * 0.2; });
+  candidatePool.forEach((chunk) => { chunk.score = (vectors ? (chunk.semantic * 0.62 + chunk.lexical * 0.38) : chunk.lexical) + priority(chunk); });
   // Indexing must NOT burn the user's Groq teaching quota. The hybrid lexical/semantic
   // ranking provides high-quality retrieval without consuming Groq tokens.
   const perSource = new Map<string, number>();
   return candidatePool.sort((a, b) => b.score - a.score).filter(chunk => {
     const count = perSource.get(chunk.sourceId) ?? 0;
-    if (count >= 2) return false;
+    if (count >= (chunk.userProvided ? 4 : 2)) return false;
     perSource.set(chunk.sourceId, count + 1); return true;
   }).slice(0, 6);
 }
 
 function contextFromChunks(chunks: ResearchChunk[]) {
-  return chunks.map((chunk, index) => `[${index + 1}] ${chunk.title}\nURL: ${chunk.url}\n${chunk.text}`).join("\n\n");
+  return chunks.map((chunk, index) => `[${index + 1}] ${chunk.title}${chunk.userProvided ? " (user-provided evidence; prioritize this material)" : ""}\nURL: ${chunk.url}\n${chunk.text}`).join("\n\n");
+}
+
+function userEvidence(options: SourceResearchOptions) {
+  const materials = sourceMaterialsSchema.parse(options.sourceMaterials ?? []);
+  const sources: ResearchSource[] = [];
+  const chunks: ResearchChunk[] = [];
+  for (const material of materials) {
+    const text = sourceEvidenceText(material);
+    if (text.length < 20) continue;
+    const source = { id: `user-${crypto.createHash("sha256").update(material.id).digest("hex").slice(0, 32)}`, title: material.title, url: sourceMaterialUrl(material), publisher: `Your ${material.kind === "youtube" ? "YouTube transcript" : material.kind.toUpperCase()} source`, summary: text.replace(/\s+/g, " ").slice(0, 500), score: 1.0 };
+    sources.push(source);
+    chunkText(text, 1800, 65).forEach((part, index) => chunks.push({ id: `${source.id}-${index + 1}`, sourceId: source.id, title: source.title, url: source.url, text: part, lexical: 0, semantic: 0, score: 1, userProvided: true }));
+  }
+  return { sources, chunks };
 }
 
 async function saveIndex(sessionId: string, index: ResearchIndex) {
+  // Bound the process-local cache; clients resend their own session materials.
+  for (const [key, value] of researchIndexes) if (Date.now() - value.indexedAt > 6 * 60 * 60 * 1000) researchIndexes.delete(key);
+  if (researchIndexes.size >= 100) researchIndexes.delete(researchIndexes.keys().next().value!);
   researchIndexes.set(indexKey(sessionId), index);
 }
 
@@ -118,7 +138,7 @@ async function loadIndex(sessionId: string): Promise<ResearchIndex | null> {
   return researchIndexes.get(key) ?? null;
 }
 
-export async function retrieveSessionContext(question: string, sessionId: string, fallbackSources: ResearchSource[] = [], groqOptions: GroqCallOptions = {}): Promise<{ sources: ResearchSource[]; context: string; indexed: boolean }> {
+export async function retrieveSessionContext(question: string, sessionId: string, fallbackSources: ResearchSource[] = [], groqOptions: GroqCallOptions = {}, options?: SourceResearchOptions): Promise<{ sources: ResearchSource[]; context: string; indexed: boolean }> {
   groqOptions.signal?.throwIfAborted();
   const stored = await loadIndex(sessionId);
   const fallbackChunks: ResearchChunk[] = fallbackSources.map((source, index) => ({
@@ -130,21 +150,41 @@ export async function retrieveSessionContext(question: string, sessionId: string
     lexical: 0,
     semantic: 0,
     score: 0,
+    userProvided: source.id.startsWith("user-") || isUserSourceUrl(source.url),
   }));
-  const chunks = stored?.chunks.length ? stored.chunks : fallbackChunks;
-  if (!chunks.length) return { sources: stored?.sources ?? fallbackSources, context: "", indexed: false };
+  let chunks = stored?.chunks.length ? stored.chunks : fallbackChunks;
+  let sources = stored?.sources ?? fallbackSources;
+  if (options) {
+    const replacingMaterials = options.sourceMaterials !== undefined;
+    const supplied = replacingMaterials ? userEvidence(options) : { sources: [], chunks: [] };
+    chunks = [...supplied.chunks, ...chunks.filter(chunk => chunk.userProvided ? !replacingMaterials : options.includeWebSearch !== false)];
+    sources = [...supplied.sources, ...sources.filter(source => source.id.startsWith("user-") || isUserSourceUrl(source.url) ? !replacingMaterials : options.includeWebSearch !== false)].slice(0, 20);
+    await saveIndex(sessionId, { question, sources, chunks, indexedAt: Date.now() });
+  }
+  if (!chunks.length) return { sources, context: "", indexed: false };
   const ranked = await rankChunks(question, chunks, groqOptions);
   return {
-    sources: stored?.sources ?? fallbackSources,
+    sources,
     context: contextFromChunks(ranked),
-    indexed: Boolean(stored),
+    indexed: Boolean(stored) || Boolean(options?.sourceMaterials?.length),
   };
 }
 
-export async function researchQuestion(question: string, sessionId: string, groqOptions: GroqCallOptions = {}): Promise<{ sources: ResearchSource[]; context: string }> {
+export async function researchQuestion(question: string, sessionId: string, groqOptions: GroqCallOptions = {}, options: SourceResearchOptions = {}): Promise<{ sources: ResearchSource[]; context: string }> {
   groqOptions.signal?.throwIfAborted();
+  const supplied = userEvidence(options);
+  if (options.includeWebSearch === false) {
+    if (!supplied.chunks.length && options.sourceMaterials?.some(material => material.images.length)) {
+      throw new ResearchError("NO_RESEARCH_EVIDENCE", "No readable source evidence could be extracted from the uploaded diagrams. Add clearer pages or paste the visible text, then retry; your board has been kept.");
+    }
+    const ranked = await rankChunks(question, supplied.chunks, groqOptions);
+    const context = contextFromChunks(ranked);
+    requireResearchEvidence(context, supplied.sources);
+    await saveIndex(sessionId, { question, ...supplied, indexedAt: Date.now() });
+    return { sources: supplied.sources, context };
+  }
   const tavilyKey = (await resolveProviderCredentials()).tavilyKey;
-  if (!tavilyKey) throw new ResearchError("RESEARCH_REQUIRED", "Add a Tavily key in provider settings to research this lesson. Live lessons require retrieved sources.");
+  if (!tavilyKey) throw new ResearchError("RESEARCH_REQUIRED", "Add a Tavily key for web search, or add your own sources and turn off Include Web Search.");
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new DOMException("Research request timed out", "TimeoutError")), 35000);
@@ -174,7 +214,7 @@ export async function researchQuestion(question: string, sessionId: string, groq
     if (seen.has(normalized)) return false;
     seen.add(normalized);
     return true;
-  }).sort((a, b) => sourceAuthority(b.url!) - sourceAuthority(a.url!)).slice(0, 20);
+  }).sort((a, b) => sourceAuthority(b.url!) - sourceAuthority(a.url!)).slice(0, 20 - supplied.sources.length);
 
   const sources: ResearchSource[] = unique.map((result, index) => ({
     id: `source-${index + 1}`,
@@ -194,10 +234,11 @@ export async function researchQuestion(question: string, sessionId: string, groq
 
   // Persist the fetched material before any optional embeddings or LLM work.
   // This keeps the session RAG base available even if Groq is rate-limited.
-  const storedChunks = chunks.slice(0, 120);
-  await saveIndex(sessionId, { question, sources, chunks: storedChunks, indexedAt: Date.now() });
+  const storedChunks = [...supplied.chunks, ...chunks.slice(0, 120)];
+  const combinedSources = [...supplied.sources, ...sources];
+  await saveIndex(sessionId, { question, sources: combinedSources, chunks: storedChunks, indexedAt: Date.now() });
   const ranked = await rankChunks(question, storedChunks, groqOptions);
   const context = contextFromChunks(ranked);
-  requireResearchEvidence(context, sources);
-  return { sources, context };
+  requireResearchEvidence(context, combinedSources);
+  return { sources: combinedSources, context };
 }

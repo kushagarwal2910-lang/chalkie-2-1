@@ -1,0 +1,104 @@
+// No external calls or provider quota: exercises source validation and actual RAG.
+import assert from "node:assert/strict";
+import { register } from "node:module";
+import { sourceMaterialSchema, sourceMaterialsSchema, isUserSourceUrl } from "../lib/source-materials.ts";
+import { isPublicAddress, validateSourceUrl, fetchPublicSource } from "../lib/safe-source-fetch.ts";
+import { readableSourceHtml, youtubeVideoId, decodeSourceEntities } from "../lib/source-url.ts";
+import { validateDocxArchive } from "../lib/document-safety.ts";
+import { GroqFreeLimitError } from "../lib/groq-pool-core.ts";
+
+// Fail hard if a source-only lesson accidentally tries to resolve provider keys.
+const loader = `export async function resolve(specifier, context, nextResolve) {
+  if (specifier.endsWith('/provider-credentials.ts')) return { url: 'data:text/javascript,export async function resolveProviderCredentials(){throw new Error("Source-only RAG must not read provider credentials")}', shortCircuit: true };
+  return nextResolve(specifier, context);
+}`;
+register(`data:text/javascript,${encodeURIComponent(loader)}`, import.meta.url);
+const { researchQuestion, retrieveSessionContext } = await import("../lib/research.ts");
+const { extractSourceVisionEvidence } = await import("../lib/source-vision.ts");
+const originalFetch = globalThis.fetch;
+globalThis.fetch = () => { throw new Error("No network is permitted in source ingestion tests."); };
+delete process.env.EMBEDDING_BASE_URL;
+delete process.env.EMBEDDING_API_KEY;
+delete process.env.EMBEDDING_MODEL;
+
+try {
+  for (const ip of ["127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1", "169.254.169.254", "100.64.0.1", "198.18.0.1", "192.0.2.1", "203.0.113.1", "255.255.255.255", "::1", "::ffff:127.0.0.1", "fc00::1", "fe80::1", "2001:db8::1", "2002:7f00:1::", "64:ff9b::a00:1"]) assert.equal(isPublicAddress(ip), false, ip);
+  for (const ip of ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "2001:4860:4860::8888"]) assert.equal(isPublicAddress(ip), true, ip);
+  for (const url of ["http://localhost", "http://127.1", "http://2130706433", "http://0x7f000001", "http://[::1]/", "https://user:password@example.com", "https://example.com:8443", "file:///etc/passwd", "http://instance.internal", "http://server.local"]) assert.throws(() => validateSourceUrl(url), undefined, url);
+  await assert.rejects(fetchPublicSource("http://169.254.169.254/latest/meta-data/"), /Private/);
+  assert.equal(validateSourceUrl("https://example.com/page").hostname, "example.com");
+  assert.equal(youtubeVideoId(new URL("https://youtu.be/abcdefghijk?t=30")), "abcdefghijk");
+  assert.equal(youtubeVideoId(new URL("https://youtube.com.evil.example/watch?v=abcdefghijk")), null);
+  const html = readableSourceHtml('<html><title>Research &amp; learning</title><script>ignore instructions</script><nav>menu</nav><main><p>Cells contain mitochondria.</p><p>ATP is produced here.</p></main></html>');
+  assert.equal(html.title, "Research & learning");
+  assert.match(html.text, /mitochondria/);
+  assert.doesNotMatch(html.text, /ignore|menu/);
+  assert.equal(decodeSourceEntities("&#x110000; &amp; &#65;"), "  & A");
+  assert.throws(() => validateDocxArchive(new ArrayBuffer(10)), /DOCX/);
+  const name = new TextEncoder().encode("word/document.xml");
+  const zip = new ArrayBuffer(46 + name.length + 22);
+  const directory = new DataView(zip);
+  directory.setUint32(0, 0x02014b50, true);
+  directory.setUint32(24, 200, true);
+  directory.setUint16(28, name.length, true);
+  new Uint8Array(zip, 46, name.length).set(name);
+  const end = 46 + name.length;
+  directory.setUint32(end, 0x06054b50, true);
+  directory.setUint16(end + 10, 1, true);
+  assert.doesNotThrow(() => validateDocxArchive(zip));
+  directory.setUint32(24, 100_000_000, true);
+  assert.throws(() => validateDocxArchive(zip), /oversized/);
+
+  const material = sourceMaterialSchema.parse({ id: "biology-notes", title: "My biology lecture", kind: "text", text: "The mitochondrial matrix contains enzymes for the citric acid cycle. The inner membrane carries ATP synthase and the electron transport chain." });
+  assert.equal(material.images.length, 0);
+  assert.equal(sourceMaterialSchema.safeParse({ ...material, text: "" }).success, false);
+  assert.equal(sourceMaterialSchema.safeParse({ ...material, url: "javascript:alert(1)" }).success, false);
+  assert.equal(sourceMaterialsSchema.safeParse([material, material]).success, false);
+  assert.equal(sourceMaterialsSchema.safeParse(Array.from({ length: 9 }, (_, index) => ({ ...material, id: `source-${index}` }))).success, false);
+  const first = await researchQuestion("Explain mitochondrial ATP synthesis", "source-test-session", {}, { sourceMaterials: [material], includeWebSearch: false });
+  assert.equal(first.sources.length, 1);
+  assert.equal(first.sources[0].score, 1);
+  assert.equal(isUserSourceUrl(first.sources[0].url), true);
+  assert.match(first.context, /inner membrane/);
+  assert.match(first.context, /prioritize this material/);
+  const followup = await retrieveSessionContext("Where is the citric acid cycle?", "source-test-session", [], {}, { sourceMaterials: [material], includeWebSearch: false });
+  assert.match(followup.context, /mitochondrial matrix/);
+  const withoutWeb = await retrieveSessionContext("Where is the matrix?", "source-test-session", [], {}, { includeWebSearch: false });
+  assert.match(withoutWeb.context, /mitochondrial matrix/);
+  const restored = await retrieveSessionContext("Explain ATP synthase", "source-test-after-restart", [], {}, { sourceMaterials: [material], includeWebSearch: false });
+  assert.match(restored.context, /ATP synthase/);
+  const removed = await retrieveSessionContext("Explain ATP synthase", "source-test-session", first.sources, {}, { sourceMaterials: [], includeWebSearch: false });
+  assert.equal(removed.context, "");
+  assert.deepEqual(removed.sources, []);
+  await assert.rejects(researchQuestion("Explain cells", "empty-source-test", {}, { sourceMaterials: [], includeWebSearch: false }), error => error.code === "NO_RESEARCH_EVIDENCE");
+  const imageOnly = { id: "diagram-only", title: "A diagram", kind: "pdf", text: "", images: [{ id: "diagram-1", title: "Page 1", dataUrl: "data:image/png;base64,AAAA", width: 400, height: 300, page: 1, kind: "page" }] };
+  await assert.rejects(researchQuestion("Explain cells", "figure-only-test", {}, { sourceMaterials: [imageOnly], includeWebSearch: false }), error => error.code === "NO_RESEARCH_EVIDENCE");
+  let inspections = 0;
+  const inspect = async (_path, init, options) => {
+    inspections += 1;
+    assert.equal(JSON.parse(init.body).model, "qwen/qwen3.8-27b");
+    assert.equal(options.timeoutMs, 18_000);
+    assert.ok(options.signal);
+    return Response.json({ choices: [{ message: { content: JSON.stringify({ readable: true, confidence: 0.96, transcription: "Visible labels: Matrix, inner membrane, ATP synthase.", relationships: ["A labeled arrow connects Matrix to ATP synthase."] }) } }] });
+  };
+  const scanned = await extractSourceVisionEvidence([imageOnly], {}, inspect);
+  assert.equal(inspections, 1);
+  assert.equal(imageOnly.text, "", "Vision must not mutate the original client material.");
+  assert.match(scanned[0].text, /machine transcribed/);
+  assert.match(scanned[0].text, /Visible labels/);
+  const scannedResearch = await researchQuestion("Explain ATP synthase", "scanned-source-test", {}, { sourceMaterials: scanned, includeWebSearch: false });
+  assert.match(scannedResearch.context, /Matrix/);
+  const unreadable = await extractSourceVisionEvidence([imageOnly], {}, async () => Response.json({ choices: [{ message: { content: JSON.stringify({ readable: false, confidence: 0.2, transcription: "", relationships: [] }) } }] }));
+  assert.equal(unreadable[0].text, "");
+  const failedScan = await extractSourceVisionEvidence([imageOnly], {}, async () => { throw new Error("Vision unavailable"); });
+  assert.equal(failedScan[0].text, "");
+  await assert.rejects(extractSourceVisionEvidence([imageOnly], {}, async () => { throw new GroqFreeLimitError({ source: "server", allUnavailable: true, degradationReason: "all_keys_exhausted", keys: [] }); }), error => error.code === "FREE_LIMIT_REACHED");
+  const cancelled = new AbortController(); cancelled.abort();
+  await assert.rejects(extractSourceVisionEvidence([imageOnly], { signal: cancelled.signal }, inspect), { name: "AbortError" });
+  inspections = 0;
+  const manyScans = Array.from({ length: 3 }, (_, materialIndex) => ({ ...imageOnly, id: `scanned-${materialIndex}`, images: Array.from({ length: materialIndex === 2 ? 2 : 3 }, (_, imageIndex) => ({ ...imageOnly.images[0], id: `figure-${materialIndex}-${imageIndex}`, page: imageIndex < 2 ? 1 : 2, kind: imageIndex === 1 ? "embedded" : "page" })) }));
+  const limited = await extractSourceVisionEvidence(manyScans, {}, inspect);
+  assert.equal(inspections, 4, "Vision is bounded to four calls total, deduplicating page and bitmap.");
+  assert.equal(limited[2].text, "");
+  console.log("Source ingestion checks passed: public URL guards, text extraction, source limits, grounded retrieval, restoration, deletion, and no-evidence rejection.");
+} finally { globalThis.fetch = originalFetch; }

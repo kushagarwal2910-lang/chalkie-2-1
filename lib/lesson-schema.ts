@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { imageAnnotationSchema, type ImageAnnotation } from "./visual-agent-schema.ts";
+import { plotSpecSchema } from "./plot-tool.ts";
 export { imageAnnotationSchema, type ImageAnnotation };
 
 export const canvasColors = ["ink", "slate", "blue", "cyan", "violet", "orange", "green", "red", "yellow", "white", "gray", "none"] as const;
@@ -65,25 +66,37 @@ export const visualPartSchema = z.object({
 });
 
 export const imageRegionSchema = z.object({
+  id: z.string().max(100).optional(),
   label: z.string().min(1).max(100),
   x: z.number().finite().min(0).max(1), y: z.number().finite().min(0).max(1),
   width: z.number().finite().positive().max(1), height: z.number().finite().positive().max(1),
   confidence: z.number().min(0).max(1),
 }).refine(r => r.x + r.width <= 1.001 && r.y + r.height <= 1.001, "Region exceeds image");
+export type ImageRegion = z.infer<typeof imageRegionSchema>;
 
 export const imageAssetSchema = z.object({
+  provenance: z.enum(["retrieved", "user", "generated", "plot"]).optional(),
   description: z.string().max(600).optional(),
   id: z.string().max(100), title: z.string().max(300), url: z.string().url(),
   sourceUrl: z.string().url(), author: z.string().max(500), license: z.string().max(100),
   licenseUrl: z.string().url(), width: z.number().positive(), height: z.number().positive(),
-  regions: z.array(imageRegionSchema).max(12),
+  regions: z.array(imageRegionSchema).max(64),
 });
 export type ImageAsset = z.infer<typeof imageAssetSchema>;
 
 export const visualObjectSchema = z.object({
+  plot: z.preprocess((val) => {
+    if (!val || typeof val !== "object") return undefined;
+    const kind = (val as any).kind;
+    if (!["bar", "line", "scatter", "curve", "forces", "timeline"].includes(kind)) {
+      return undefined;
+    }
+    return val;
+  }, plotSpecSchema.optional()),
+  plotMetadata: z.any().optional(),
   comparisonSide: z.enum(["left", "right", "full"]).optional(),
   image: imageAssetSchema.optional(),
-  imageRequest: z.object({ query: z.string().max(160), status: z.enum(["ready", "not_found", "rejected", "unavailable"]) }).optional(),
+  imageRequest: z.object({ query: z.string().max(160), status: z.enum(["ready", "not_found", "rejected", "unavailable"]), reason: z.string().max(300).optional() }).optional(),
   annotations: z.array(imageAnnotationSchema).optional(),
   id: z.string().min(1).max(200),
   parentId: z.string().max(200).optional(),
@@ -145,7 +158,14 @@ export const visualConnectionSchema = z.object({
   labelPosition: z.object({ x: z.number().finite(), y: z.number().finite(), width: z.number().nonnegative(), height: z.number().nonnegative() }).optional(),
 });
 
+export const teachingCueSchema = z.object({
+  phrase: z.string().min(1).max(240), targetId: z.string().min(1).max(200),
+  kind: z.enum(["focus", "arrow", "circle", "bracket"]), toTargetId: z.string().max(200).optional(),
+});
+export const lessonLanguageSchema = z.object({ mode: z.enum(["native", "code-switch"]), language: z.string().max(16) });
 export const lessonSegmentSchema = z.object({
+  cues: z.array(teachingCueSchema).max(24).optional(),
+  language: lessonLanguageSchema.optional(),
   id: z.string().min(1).max(200),
   title: z.preprocess((val) => (val == null ? "" : String(val)), z.string().default("")),
   narration: z.string().min(1).max(2400),
@@ -158,6 +178,8 @@ export const lessonSegmentSchema = z.object({
 });
 
 export const lessonPlanSchema = z.object({
+  sourceSessionId: z.string().max(120).optional(),
+  language: lessonLanguageSchema.optional(),
   version: z.literal(2).optional(),
   teachingMode: z.enum(teachingModes).optional(),
   id: z.preprocess((val) => (val ? String(val) : `lesson-${Date.now()}`), z.string().min(1).max(80).default(() => `lesson-${Date.now()}`)),
@@ -173,6 +195,7 @@ export const lessonPlanSchema = z.object({
 });
 
 export const followUpPlanSchema = z.object({
+  language: lessonLanguageSchema.optional(),
   teachingMode: z.enum(teachingModes).optional(),
   sources: z.array(researchSourceSchema).max(20).optional(),
   id: z.preprocess((val) => (val ? String(val) : `follow-up-${Date.now()}`), z.string().min(1).max(80).default(() => `follow-up-${Date.now()}`)),

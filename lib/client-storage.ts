@@ -1,4 +1,5 @@
 import type { LessonPlan } from "@/lib/lesson-schema";
+import { clearSourceMaterials } from "@/lib/source-storage";
 
 const DB_NAME = "chalkie-studio";
 const STORE_NAME = "sessions";
@@ -230,6 +231,7 @@ export async function deleteLesson(id: string): Promise<void> {
 }
 
 export async function clearAllClientStorage(): Promise<void> {
+  try { await clearSourceMaterials(); } catch { /* Continue resetting even when source IndexedDB is unavailable. */ }
   try {
     const database = await openDatabase();
     await new Promise<void>((resolve, reject) => {

@@ -1,19 +1,20 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { Excalidraw, convertToExcalidrawElements, restoreElements, CaptureUpdateAction } from "@excalidraw/excalidraw";
 import type { ExcalidrawImperativeAPI, BinaryFileData, AppState } from "@excalidraw/excalidraw/types";
 import type { ExcalidrawElement, FileId } from "@excalidraw/excalidraw/element/types";
 import type { ExcalidrawElementSkeleton } from "@excalidraw/excalidraw/data/transform";
 import type { LessonPlan, LessonSegment } from "@/lib/lesson-schema";
 import type { CanvasPlaybackState } from "@/lib/playback-sync";
-import { getProgressiveVisibleObjects } from "@/lib/progressive-scene";
+import { getProgressiveVisibleObjects, getProgressiveScene } from "@/lib/progressive-scene";
 import { loadImageBlob } from "@/lib/image-cache";
-import { projectImageRegion, getRegionCenter } from "@/lib/image-coordinates";
-import { boardFontSize, boardTextLines, teachingFrameIds } from "@/lib/teaching-layout";
+import { boundsForPoints, cameraForTarget, interactionCurve, resolveTeachingTarget, type TeachingCue, type TeachingTarget, type Point } from "@/lib/teaching-focus";
+import { boardFontSize, boardTextLines } from "@/lib/teaching-layout";
 import { compileImageAnnotationSkeletons } from "@/lib/image-annotations";
 
 import { routeOrthogonalConnector } from "@/lib/connector-routing";
+import { formatCardMathForCanvas } from "@/lib/math-formatter";
 import { PenTool, EyeOff } from "lucide-react";
 
 declare global { interface Window { EXCALIDRAW_ASSET_PATH?: string } }
@@ -39,13 +40,18 @@ function convertStable(skeleton: ExcalidrawElementSkeleton[], owner: string): Ex
     if (updated.type === "text" && updated.containerId) {
       const container = elements.find(c => (ids.get(c.id) ?? c.id) === updated.containerId || c.id === updated.containerId);
       if (container && Number.isFinite(container.width)) {
-        const maxInnerWidth = Math.max(40, container.width - 36);
-        const textWidth = Math.min(updated.width, maxInnerWidth);
-        const textObj = updated as unknown as { width: number; x: number; textAlign: string; verticalAlign: string };
+        const textObj = updated as unknown as { width: number; x: number; textAlign: string; verticalAlign: string; text?: string; fontSize?: number };
+        const lines = (textObj.text || "").split("\n");
+        const longestLineLength = Math.max(...lines.map(l => l.length), 0);
+        const fSize = textObj.fontSize || 20;
+        const estimatedTextWidth = Math.max(textObj.width, longestLineLength * fSize * 0.62);
+        const maxInnerWidth = Math.max(40, container.width - 48); // 24px padding on each side
+        const textWidth = Math.min(estimatedTextWidth, maxInnerWidth);
         textObj.width = textWidth;
         textObj.textAlign = "center";
         textObj.verticalAlign = "middle";
-        textObj.x = container.x + (container.width - textWidth) / 2;
+        // Clamp x so first character NEVER starts at or left of container.x + 20 and has >= 20px margin
+        textObj.x = Math.max(container.x + 20, container.x + (container.width - textWidth) / 2);
       }
     }
     return updated;
@@ -73,9 +79,10 @@ function sceneFor(lesson: LessonPlan, images: Set<string>) {
       const height = o.width * o.image.height / o.image.width;
       skeleton = [
         { ...common, type: "image", height, fileId: o.image.id as FileId, status: "saved", scale: [1, 1] },
-        { type: "text", id: `${o.id}-caption`, x: o.x, y: o.y + height + 14, text: o.label, fontSize: 20, strokeColor: "#f1f5f9", width: o.width }
+        { type: "text", id: `${o.id}-caption`, x: o.x, y: o.y + height + 14, fontFamily: /[^\u0000-\u024f]/.test(o.label) ? 2 : 5, text: formatCardMathForCanvas(o.image.provenance === "generated" ? `${o.label}\nAI-generated illustration` : o.label), fontSize: 20, strokeColor: "#f1f5f9", width: o.width }
       ];
-      if (o.annotations && o.annotations.length > 0) {
+      // Do NOT generate external margin callout arrows on generated plots
+      if (o.annotations && o.annotations.length > 0 && o.image.provenance !== "plot") {
         skeleton.push(...compileImageAnnotationSkeletons(o, o.annotations));
       }
     } else if (o.shapeType === "note" || o.shapeType === "image") {
@@ -84,7 +91,14 @@ function sceneFor(lesson: LessonPlan, images: Set<string>) {
         type: "rectangle",
         roundness: { type: 3 },
         strokeWidth: 1.5,
-        label: { text: boardTextLines(o).join("\n"), fontSize: boardFontSize(o), strokeColor: "#f1f5f9", textAlign: "center", verticalAlign: "middle" }
+        label: {
+          fontFamily: /[^\u0000-\u024f]/.test(o.label) ? 2 : 5,
+          text: boardTextLines(o).join("\n"),
+          fontSize: 20,
+          strokeColor: "#f1f5f9",
+          textAlign: "center",
+          verticalAlign: "middle",
+        }
       }];
     } else {
       const geoStroke = isSubject ? "#a78bfa" : "#38bdf8";
@@ -95,7 +109,13 @@ function sceneFor(lesson: LessonPlan, images: Set<string>) {
         roundness: o.geo === "ellipse" ? null : { type: 3 },
         strokeColor: geoStroke,
         backgroundColor: geoFill,
-        label: { text: boardTextLines(o).join("\n"), fontSize: 22, strokeColor: "#f1f5f9", textAlign: "center", verticalAlign: "middle" }
+        label: {
+          text: boardTextLines(o).join("\n"),
+          fontSize: 20,
+          strokeColor: "#f1f5f9",
+          textAlign: "center",
+          verticalAlign: "middle",
+        }
       }];
     }
     scene.push(...convertStable(skeleton, o.id).map(el => ({ ...el, groupIds: [`group-${o.id}`], customData: { chalkieId: o.id, ...el.customData } })));
@@ -153,189 +173,66 @@ function sceneFor(lesson: LessonPlan, images: Set<string>) {
   });
 }
 
-export function ChalkCanvas({ lesson, activeSegment, activeStep, isPresenting, isSpeaking = false, activeTargetId = null, revealedStep = null, playbackRequest = 0, onPlaybackState }: {
-  lesson?: LessonPlan | null; activeSegment?: LessonSegment | null; activeStep: number; isPresenting: boolean; isSpeaking?: boolean; activeTargetId?: string | null; revealedStep?: number | null; playbackRequest?: number; onPlaybackState?: (state: CanvasPlaybackState) => void;
+export function ChalkCanvas({ lesson, activeSegment, activeStep, isPresenting, isSpeaking = false, activeTargetId = null, activeCue = null, revealedStep = null, playbackRequest = 0, onPlaybackState }: {
+  lesson?: LessonPlan | null; activeSegment?: LessonSegment | null; activeStep: number; isPresenting: boolean; isSpeaking?: boolean; activeTargetId?: string | null; activeCue?: TeachingCue | null; revealedStep?: number | null; playbackRequest?: number; onPlaybackState?: (state: CanvasPlaybackState) => void;
 }) {
   const [api, setApi] = useState<ExcalidrawImperativeAPI | null>(null);
   const [showTools, setShowTools] = useState(false);
   const [ready, setReady] = useState<LessonPlan | null>(null);
   const [imageNotice, setImageNotice] = useState("");
-  const [regionBadge, setRegionBadge] = useState<string | null>(null);
-  const [laserPos, setLaserPos] = useState<{ x: number; y: number } | null>(null);
-  const currentLaserRef = useRef<{ x: number; y: number } | null>(null);
+  const [pausedCameraRequest, setPausedCameraRequest] = useState<string | null>(null);
+  const cameraRequest = `${lesson?.id}:${playbackRequest}`;
+  const cameraPaused = pausedCameraRequest === cameraRequest;
+  const [reducedMotion, setReducedMotion] = useState(false);
+  const [overlaySnapshot, setOverlay] = useState<{
+    lessonId: string;
+    target: TeachingTarget; destination: TeachingTarget | null;
+    zoom: number; scrollX: number; scrollY: number; width: number; height: number;
+  } | null>(null);
+  const markerId = useId().replace(/:/g, "");
   const sceneRef = useRef<ExcalidrawElement[]>([]);
   const programmatic = useRef(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const targetRef = useRef<string | null>(null);
-  const lessonRef = useRef(lesson);
+  const cameraAnimation = useRef(0);
+  const queueCameraFrame = useRef<(() => void) | null>(null);
+  const editorViewport = useRef<{ width: number; height: number } | null>(null);
+  const activeTarget = activeCue?.targetId ?? activeTargetId ?? activeSegment?.targetIds?.[0] ?? null;
+  const overlay = isSpeaking && ready === lesson && overlaySnapshot?.lessonId === lesson?.id && overlaySnapshot?.target.id === activeTarget ? overlaySnapshot : null;
 
   useEffect(() => {
-    targetRef.current = activeTargetId || activeSegment?.targetIds?.[0] || null;
-    lessonRef.current = lesson;
-  }, [activeTargetId, activeSegment, lesson]);
+    const query = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const update = () => setReducedMotion(query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
 
-  const resolveWorldTarget = useCallback((): { x: number; y: number; label?: string } | null => {
-    let target = targetRef.current;
-    if (!target) {
-      target = activeSegment?.targetIds?.[0]
-        ?? lessonRef.current?.objects.find(o => o.role === "subject" || o.shapeType === "image" || o.image)?.id
-        ?? lessonRef.current?.objects[0]?.id
-        ?? null;
-    }
-    if (!target && !lessonRef.current?.objects.length) return null;
+  const pauseCamera = useCallback(() => {
+    cancelAnimationFrame(cameraAnimation.current);
+    setPausedCameraRequest(cameraRequest);
+  }, [cameraRequest]);
 
-    const [id, subId] = (target ?? "").split("#");
-    const obj = lessonRef.current?.objects.find(o => o.id === id);
-
-    if (obj) {
-      const imgW = obj.width;
-      const imgH = obj.image ? obj.width * (obj.image.height / obj.image.width) : obj.height;
-
-      if (subId !== undefined) {
-        const numIdx = Number(subId);
-
-        // 1. Try annotation match
-        const foundAnn = (!isNaN(numIdx) && obj.annotations?.[numIdx])
-          || obj.annotations?.find(a => a.id === subId || a.regionLabel.toLowerCase() === subId.toLowerCase());
-        if (foundAnn) {
-          const center = getRegionCenter({ x: obj.x, y: obj.y, width: imgW, height: imgH }, foundAnn.normalized);
-          return { x: center.x, y: center.y, label: foundAnn.calloutText || foundAnn.regionLabel };
-        }
-
-        // 2. Try region match from VLM detection
-        const foundReg = (!isNaN(numIdx) && obj.image?.regions?.[numIdx])
-          || obj.image?.regions?.find(r => r.label.toLowerCase() === subId.toLowerCase());
-        if (foundReg) {
-          const center = getRegionCenter({ x: obj.x, y: obj.y, width: imgW, height: imgH }, foundReg);
-          return { x: center.x, y: center.y, label: foundReg.label };
-        }
-
-        // 3. Try card parts (bullet lines inside a flowchart card)
-        const foundPart = (!isNaN(numIdx) && obj.parts?.[numIdx])
-          || obj.parts?.find(p => (p.text || "").toLowerCase() === subId.toLowerCase());
-        if (foundPart) {
-          const pIdx = (!isNaN(numIdx) && obj.parts?.[numIdx]) ? numIdx : obj.parts.indexOf(foundPart);
-          const partCount = Math.max(1, obj.parts.length);
-          const py = obj.y + ((pIdx + 0.5) / partCount) * obj.height;
-          return { x: obj.x + obj.width * 0.5, y: py, label: foundPart.text || obj.label };
-        }
-      }
-
-      // Default to center of object
-      return {
-        x: obj.x + obj.width * 0.5,
-        y: obj.y + (obj.image ? imgH * 0.5 : obj.height * 0.5),
-        label: obj.label || activeSegment?.title
-      };
-    }
-
-    // Check if target is an annotation across all objects
-    for (const o of lessonRef.current?.objects ?? []) {
-      const ann = o.annotations?.find(a => a.id === id || a.regionLabel.toLowerCase() === id.toLowerCase());
-      if (ann) {
-        const imgW = o.width;
-        const imgH = o.image ? o.width * (o.image.height / o.image.width) : o.height;
-        const center = getRegionCenter({ x: o.x, y: o.y, width: imgW, height: imgH }, ann.normalized);
-        return { x: center.x, y: center.y, label: ann.calloutText || ann.regionLabel };
-      }
-    }
-
-    // Check if target is a flowchart transition connector
-    const conn = lessonRef.current?.connections.find(c => c.id === id || c.label.toLowerCase() === id.toLowerCase());
-    if (conn) {
-      const fromObj = lessonRef.current?.objects.find(o => o.id === conn.from);
-      const toObj = lessonRef.current?.objects.find(o => o.id === conn.to);
-      if (fromObj && toObj) {
-        return {
-          x: (fromObj.x + fromObj.width / 2 + toObj.x + toObj.width / 2) / 2,
-          y: (fromObj.y + fromObj.height / 2 + toObj.y + toObj.height / 2) / 2,
-          label: conn.label || "Flowchart Transition"
-        };
-      }
-    }
-
-    // Try scene elements
-    const el = sceneRef.current.find(e => e.id === id || e.customData?.chalkieId === id || e.customData?.annotationId === id);
-    if (el) {
-      return {
-        x: el.x + el.width * 0.5,
-        y: el.y + el.height * 0.5,
-        label: activeSegment?.title || (el.customData as any)?.regionLabel
-      };
-    }
-
-    // Fallback to first object in lesson
-    const first = lessonRef.current?.objects[0];
-    if (first) {
-      const firstH = first.image ? first.width * (first.image.height / first.image.width) : first.height;
-      return {
-        x: first.x + first.width * 0.5,
-        y: first.y + firstH * 0.5,
-        label: first.label || activeSegment?.title
-      };
-    }
-
-    return null;
-  }, [activeSegment]);
-
+  // Focus is attached to the live image transform, including user resize/rotation/flip.
+  // There is no wandering cursor and no fallback to an unrelated object's center.
   useEffect(() => {
-    let animId: number;
-    let wanderTick = 0;
-
-    const animateLaser = () => {
-      if (!api || !ready) {
-        animId = requestAnimationFrame(animateLaser);
-        return;
-      }
-
-      const worldTarget = resolveWorldTarget();
-      if (!worldTarget) {
-        currentLaserRef.current = null;
-        setLaserPos(null);
-        setRegionBadge(null);
-        animId = requestAnimationFrame(animateLaser);
-        return;
-      }
-
+    if (!api || ready !== lesson || !lesson || !isSpeaking) return;
+    let frame = 0;
+    let lastSnapshot = "";
+    const update = () => {
+      const elements = api.getSceneElements();
+      const target = resolveTeachingTarget(activeTarget, lesson.objects, lesson.connections, elements);
+      const destination = activeCue?.toTargetId ? resolveTeachingTarget(activeCue.toTargetId, lesson.objects, lesson.connections, elements) : null;
       const state = api.getAppState();
-      if (!state) {
-        animId = requestAnimationFrame(animateLaser);
-        return;
+      const snapshot = JSON.stringify([target, destination, state.zoom.value, state.scrollX, state.scrollY, state.width, state.height]);
+      if (snapshot !== lastSnapshot) {
+        setOverlay(target ? { lessonId: lesson.id, target, destination, zoom: state.zoom.value, scrollX: state.scrollX, scrollY: state.scrollY, width: state.width, height: state.height } : null);
+        lastSnapshot = snapshot;
       }
-
-      // Project the world target directly using live scrollX, scrollY, and zoom
-      const targetScreenX = (worldTarget.x + state.scrollX) * state.zoom.value;
-      const targetScreenY = (worldTarget.y + state.scrollY) * state.zoom.value;
-
-      wanderTick += 0.03;
-      // Precise organic micro-breathing (under 0.8px) so the tip stays 100% locked on target
-      const wanderX = Math.sin(wanderTick * 1.6) * 0.6;
-      const wanderY = Math.cos(wanderTick * 1.9) * 0.5;
-
-      const destX = targetScreenX + wanderX;
-      const destY = targetScreenY + wanderY;
-
-      const cur = currentLaserRef.current ?? { x: destX, y: destY };
-      const dx = destX - cur.x;
-      const dy = destY - cur.y;
-
-      if (Math.abs(dx) > 0.1 || Math.abs(dy) > 0.1) {
-        cur.x += dx * 0.25;
-        cur.y += dy * 0.25;
-        currentLaserRef.current = { ...cur };
-        setLaserPos({ ...cur });
-      } else {
-        currentLaserRef.current = { x: destX, y: destY };
-        setLaserPos({ x: destX, y: destY });
-      }
-
-      setRegionBadge(worldTarget.label ?? activeSegment?.title ?? null);
-      animId = requestAnimationFrame(animateLaser);
+      frame = requestAnimationFrame(update);
     };
-
-    animId = requestAnimationFrame(animateLaser);
-    return () => cancelAnimationFrame(animId);
-  }, [api, ready, isSpeaking, resolveWorldTarget, activeSegment]);
+    frame = requestAnimationFrame(update);
+    return () => cancelAnimationFrame(frame);
+  }, [api, ready, lesson, isSpeaking, activeTarget, activeCue?.toTargetId]);
 
   useEffect(() => {
     if (!api || !lesson) return;
@@ -348,7 +245,25 @@ export function ChalkCanvas({ lesson, activeSegment, activeStep, isPresenting, i
         const asset = o.image!;
         try {
           const blob = await loadImageBlob(asset.id, asset.url, controller.signal);
-          const bitmap = await createImageBitmap(blob); bitmap.close();
+          if (blob.type.split(";")[0] === "image/svg+xml") {
+            if (typeof Image !== "undefined") {
+              const objectUrl = URL.createObjectURL(blob);
+              try {
+                const image = new Image();
+                image.src = objectUrl;
+                if (typeof image.decode === "function") {
+                  await image.decode().catch(() => undefined);
+                }
+              } catch {
+                // validation is optional
+              } finally {
+                URL.revokeObjectURL(objectUrl);
+              }
+            }
+          } else if (typeof createImageBitmap === "function") {
+            const bitmap = await createImageBitmap(blob);
+            bitmap.close();
+          }
           const dataURL = await new Promise<string>((resolve, reject) => { const r = new FileReader(); r.onload = () => resolve(String(r.result)); r.onerror = reject; r.readAsDataURL(blob); });
           files.push({ id: asset.id as FileId, dataURL: dataURL as BinaryFileData["dataURL"], mimeType: blob.type as BinaryFileData["mimeType"], created: Date.now() }); loaded.add(asset.id);
         } catch { if (!controller.signal.aborted) failedImage = true; }
@@ -360,7 +275,7 @@ export function ChalkCanvas({ lesson, activeSegment, activeStep, isPresenting, i
         const saved = JSON.parse(localStorage.getItem(`chalkie:scene-v2:${lesson.id}`) || "null");
         if (Array.isArray(saved)) {
           // Never restore old/stale annotation elements (arrows, badges, shade/contour boxes) from localStorage
-          const isAnnotationEl = (id: string, data?: any) =>
+          const isAnnotationEl = (id: string, data?: ExcalidrawElement["customData"]) =>
             id.startsWith("ann-") ||
             id.endsWith("-arrow") ||
             id.endsWith("-badge") ||
@@ -390,42 +305,136 @@ export function ChalkCanvas({ lesson, activeSegment, activeStep, isPresenting, i
 
   useEffect(() => {
     if (!api || ready !== lesson || !lesson) { onPlaybackState?.({ status: "loading", request: playbackRequest }); return; }
-    const step = revealedStep === null ? activeStep : Math.max(activeStep, revealedStep);
-    const visible = new Set(getProgressiveVisibleObjects(lesson, step, revealedStep !== null).map(o => o.id));
+    const isProgressive = isPresenting || revealedStep !== null;
+    const currentStep = revealedStep !== null ? Math.max(activeStep, revealedStep) : (isPresenting ? activeStep : lesson.segments.length - 1);
+    const { visibleObjectIds, visibleConnectionIds, newlyRevealedIds } = getProgressiveScene(lesson, currentStep, isProgressive);
     const elements = sceneRef.current.filter(el => {
       const data = el.customData;
-      return !data?.chalkieId || visible.has(String(data.chalkieId)) || (data.from && visible.has(String(data.from)) && visible.has(String(data.to)));
+      if (!data?.chalkieId) return true;
+      const chalkieId = String(data.chalkieId);
+      if (visibleObjectIds.has(chalkieId)) return true;
+      if (data.from && data.to) {
+        return visibleConnectionIds.has(chalkieId) || (visibleObjectIds.has(String(data.from)) && visibleObjectIds.has(String(data.to)));
+      }
+      return false;
+    }).map(el => {
+      const data = el.customData;
+      const chalkieId = data?.chalkieId ? String(data.chalkieId) : el.id;
+      if (newlyRevealedIds.has(chalkieId)) {
+        if (el.type === "rectangle" || el.type === "ellipse") {
+          return {
+            ...el,
+            strokeColor: "#a78bfa",
+            backgroundColor: "rgba(167, 139, 250, 0.22)",
+            strokeWidth: 2.5,
+          };
+        }
+        if (el.type === "arrow") {
+          return {
+            ...el,
+            strokeColor: "#a78bfa",
+            strokeWidth: 2.5,
+          };
+        }
+      }
+      return el;
     });
     programmatic.current = true;
     api.updateScene({ elements, captureUpdate: CaptureUpdateAction.NEVER });
     programmatic.current = false;
     let second = 0;
-    const first = requestAnimationFrame(() => { second = requestAnimationFrame(() => onPlaybackState?.({ status: "ready", request: playbackRequest })); });
+    const first = requestAnimationFrame(() => { second = requestAnimationFrame(() => {
+      // updateScene commits asynchronously; frame the restored scene after its actual first paint.
+      queueCameraFrame.current?.();
+      onPlaybackState?.({ status: "ready", request: playbackRequest });
+    }); });
     return () => { cancelAnimationFrame(first); cancelAnimationFrame(second); };
-  }, [api, ready, lesson, activeStep, revealedStep, playbackRequest, onPlaybackState]);
+  }, [api, ready, lesson, activeStep, revealedStep, isPresenting, playbackRequest, onPlaybackState]);
 
   useEffect(() => {
-    if (!api || ready !== lesson) return;
-    if (!lesson) return;
-    const targets = teachingFrameIds(lesson, activeSegment?.targetIds ?? []);
-    const elements = api.getSceneElements();
-    const focused = targets.size ? elements.filter(el => targets.has(String(el.customData?.chalkieId))) : elements;
-    if (focused.length) api.scrollToContent(focused, { fitToContent: true, animate: isPresenting, duration: 350 });
-  }, [api, ready, lesson, activeSegment, isPresenting]);
-
-  useEffect(() => {
-    if (!api || ready !== lesson || !lesson) return;
-    const handleResize = () => {
-      const targets = teachingFrameIds(lesson, activeSegment?.targetIds ?? []);
+    cancelAnimationFrame(cameraAnimation.current);
+    if (!api || ready !== lesson || !lesson || cameraPaused) return;
+    const container = document.getElementById(`chalkie-canvas-${markerId}`);
+    let pendingFrame = 0;
+    let settledFrame = 0;
+    let disposed = false;
+    const frameCamera = () => {
+      cancelAnimationFrame(cameraAnimation.current);
+      const width = container?.clientWidth ?? 0, height = container?.clientHeight ?? 0;
+      if (width < 2 || height < 2) return; // Hidden/resizing panels do not define a usable viewport.
       const elements = api.getSceneElements();
-      const focused = targets.size ? elements.filter(el => targets.has(String(el.customData?.chalkieId))) : elements;
-      if (focused.length) api.scrollToContent(focused, { fitToContent: true, animate: false });
+      let target = resolveTeachingTarget(activeTarget, lesson.objects, lesson.connections, elements);
+      if (!target && !isPresenting && activeTarget) target = resolveTeachingTarget(activeTarget.split("#")[0], lesson.objects, lesson.connections, elements);
+      if (!target && (!activeSegment || !isPresenting)) {
+        const targets = lesson.objects.map(o => resolveTeachingTarget(o.id, lesson.objects, lesson.connections, elements)).filter((t): t is TeachingTarget => !!t);
+        if (targets.length) {
+          const bounds = boundsForPoints(targets.flatMap(t => t.polygon));
+          target = { ...targets[0], kind: "card", bounds, center: { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 } };
+        }
+      }
+      if (!target) return;
+      if (activeCue?.kind === "arrow" && activeCue.toTargetId) {
+        const destination = resolveTeachingTarget(activeCue.toTargetId, lesson.objects, lesson.connections, elements);
+        if (destination && interactionCurve(target, destination)) {
+          const bounds = boundsForPoints([...target.polygon, ...destination.polygon]);
+          target = { ...target, bounds, center: { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 } };
+        }
+      }
+      const state = api.getAppState();
+      // The editor's state dimensions can lag a responsive panel resize by a React commit.
+      // Fit to the actual drawable container instead of persisting that transient stale frame.
+      const desired = cameraForTarget(target, { width, height });
+      const start = { x: width / (2 * state.zoom.value) - state.scrollX, y: height / (2 * state.zoom.value) - state.scrollY, zoom: state.zoom.value };
+      const end = { x: width / (2 * desired.zoom) - desired.scrollX, y: height / (2 * desired.zoom) - desired.scrollY };
+      const startedAt = performance.now();
+      const duration = reducedMotion ? 0 : 550;
+      const animate = (now: number) => {
+        const progress = duration ? Math.min(1, (now - startedAt) / duration) : 1;
+        const eased = progress * progress * (3 - 2 * progress);
+        const zoom = Math.exp(Math.log(start.zoom) + (Math.log(desired.zoom) - Math.log(start.zoom)) * eased);
+        programmatic.current = true;
+        api.updateScene({ appState: {
+          zoom: { value: zoom as AppState["zoom"]["value"] },
+          scrollX: width / (2 * zoom) - (start.x + (end.x - start.x) * eased),
+          scrollY: height / (2 * zoom) - (start.y + (end.y - start.y) * eased),
+        }, captureUpdate: CaptureUpdateAction.NEVER });
+        programmatic.current = false;
+        if (progress < 1) cameraAnimation.current = requestAnimationFrame(animate);
+      };
+      cameraAnimation.current = requestAnimationFrame(animate);
     };
-    window.addEventListener("resize", handleResize);
-    return () => window.removeEventListener("resize", handleResize);
-  }, [api, ready, lesson, activeSegment]);
+    const scheduleFrame = () => {
+      cancelAnimationFrame(pendingFrame);
+      cancelAnimationFrame(settledFrame);
+      let retries = 0;
+      const settle = () => {
+        if (disposed) return;
+        const state = api.getAppState();
+        const width = container?.clientWidth ?? 0, height = container?.clientHeight ?? 0;
+        if (width < 2 || height < 2) return;
+        const dimensionsReady = Math.abs(state.width - width) <= 2 && Math.abs(state.height - height) <= 2;
+        const sceneReady = api.getSceneElements().length > 0;
+        if ((!dimensionsReady || !sceneReady) && retries++ < 12) { settledFrame = requestAnimationFrame(settle); return; }
+        if (sceneReady) frameCamera();
+      };
+      pendingFrame = requestAnimationFrame(() => { settledFrame = requestAnimationFrame(settle); });
+    };
+    queueCameraFrame.current = scheduleFrame;
+    scheduleFrame();
+    const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(scheduleFrame) : null;
+    if (container) observer?.observe(container);
+    return () => {
+      disposed = true;
+      if (queueCameraFrame.current === scheduleFrame) queueCameraFrame.current = null;
+      cancelAnimationFrame(pendingFrame); cancelAnimationFrame(settledFrame); cancelAnimationFrame(cameraAnimation.current); observer?.disconnect();
+    };
+  }, [api, ready, lesson, activeSegment, activeTarget, activeCue?.kind, activeCue?.toTargetId, isPresenting, cameraPaused, reducedMotion, markerId]);
 
-  const handleChange = useCallback((elements: readonly ExcalidrawElement[], _state: AppState) => {
+  const handleChange = useCallback((elements: readonly ExcalidrawElement[], state: AppState) => {
+    if (editorViewport.current?.width !== state.width || editorViewport.current?.height !== state.height) {
+      editorViewport.current = { width: state.width, height: state.height };
+      queueCameraFrame.current?.();
+    }
     if (!programmatic.current && ready && !isPresenting) {
       const updates = new Map(elements.map(el => [el.id, el]));
       sceneRef.current = sceneRef.current.map(el => updates.get(el.id) || el);
@@ -435,7 +444,34 @@ export function ChalkCanvas({ lesson, activeSegment, activeStep, isPresenting, i
     }
   }, [ready, isPresenting]);
 
-  return <div className={`excalidraw-shell relative h-full w-full ${isPresenting ? "is-teaching" : ""} ${showTools ? "with-tools" : ""}`} aria-label="Interactive teaching whiteboard">
+  const screen = (point: Point): Point => overlay ? { x: (point.x + overlay.scrollX) * overlay.zoom, y: (point.y + overlay.scrollY) * overlay.zoom } : point;
+  const screenPoints = overlay?.target.polygon.map(screen) ?? [];
+  const pointer = overlay ? screen(overlay.target.center) : null;
+  const curve = overlay?.destination ? interactionCurve(overlay.target, overlay.destination) : null;
+  const curvePath = curve ? (() => { const a = screen(curve.start), b = screen(curve.control), c = screen(curve.end); return `M ${a.x} ${a.y} Q ${b.x} ${b.y} ${c.x} ${c.y}`; })() : null;
+  const focusPath = screenPoints.length ? `M ${screenPoints.map(p => `${p.x} ${p.y}`).join(" L ")} Z` : "";
+  let drawingPath = "";
+  if (screenPoints.length === 4 && overlay?.target.kind === "region") {
+    const [a, b, c, d] = screenPoints;
+    const mix = (p: Point, q: Point, t: number) => ({ x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t });
+    if (activeCue?.kind === "circle") {
+      const center = mix(a, c, 0.5);
+      const points = Array.from({ length: 49 }, (_, i) => {
+        const angle = i / 48 * Math.PI * 2;
+        return { x: center.x + (b.x - a.x) / 2 * Math.cos(angle) + (d.x - a.x) / 2 * Math.sin(angle), y: center.y + (b.y - a.y) / 2 * Math.cos(angle) + (d.y - a.y) / 2 * Math.sin(angle) };
+      });
+      drawingPath = `M ${points.map(p => `${p.x} ${p.y}`).join(" L ")} Z`;
+    } else if (activeCue?.kind === "bracket") {
+      const points = [mix(a, b, 0.18), a, d, mix(d, c, 0.18), mix(b, a, 0.18), b, c, mix(c, d, 0.18)];
+      drawingPath = points.map((p, i) => `${i === 0 || i === 4 ? "M" : "L"} ${p.x} ${p.y}`).join(" ");
+    }
+  }
+  const drawingKey = `${activeSegment?.id}-${activeCue?.phrase}-${activeCue?.kind}-${activeCue?.targetId}-${activeCue?.toTargetId}`;
+
+  return <div id={`chalkie-canvas-${markerId}`} className={`excalidraw-shell relative h-full w-full ${isPresenting ? "is-teaching" : ""} ${showTools ? "with-tools" : ""}`} aria-label="Interactive teaching whiteboard"
+    onWheelCapture={pauseCamera}
+    onPointerDownCapture={event => { if (!(event.target as Element).closest("button")) pauseCamera(); }}
+    onKeyDownCapture={event => { if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "+", "-"].includes(event.key)) pauseCamera(); }}>
     <Excalidraw excalidrawAPI={setApi} theme="dark" viewModeEnabled={isPresenting || !showTools} initialData={INITIAL_DATA} UIOptions={UI_OPTIONS} onChange={handleChange} />
     {!isPresenting && (
       <button
@@ -458,80 +494,29 @@ export function ChalkCanvas({ lesson, activeSegment, activeStep, isPresenting, i
         )}
       </button>
     )}
-    {laserPos && (
+    {cameraPaused && isPresenting && <button type="button" onClick={() => setPausedCameraRequest(null)} className="absolute right-3 top-3 z-30 rounded-lg border border-cyan-700 bg-slate-950/95 px-3 py-2 text-xs text-cyan-100">Follow teacher camera</button>}
+    {overlay && pointer && (
       <svg className="pointer-events-none absolute inset-0 z-20 h-full w-full overflow-hidden" aria-hidden="true">
         <defs>
-          <filter id="laser-dot-glow" x="-100%" y="-100%" width="300%" height="300%">
-            <feDropShadow dx="0" dy="0" stdDeviation="3.5" floodColor="#ff1744" floodOpacity="0.95" />
-            <feDropShadow dx="0" dy="0" stdDeviation="8" floodColor="#ff0033" floodOpacity="0.75" />
-          </filter>
+          <marker id={`${markerId}-arrow`} viewBox="0 0 12 12" refX="10" refY="6" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 1 1 L 10 6 L 1 11" fill="none" stroke="#67e8f9" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></marker>
+          {curvePath && <mask id={`${markerId}-reveal`} maskUnits="userSpaceOnUse" x="0" y="0" width={overlay.width} height={overlay.height}>
+            <path key={drawingKey} d={curvePath} fill="none" stroke="white" strokeWidth="32" strokeLinecap="round" pathLength="1" strokeDasharray="1" strokeDashoffset="0">
+              {!reducedMotion && <animate attributeName="stroke-dashoffset" from="1" to="0" dur="0.65s" fill="freeze" />}
+            </path>
+          </mask>}
         </defs>
-
-        {/* Sleek Teacher Pointer Cursor with Glowing Laser Tip */}
-        <g transform={`translate(${laserPos.x}, ${laserPos.y})`}>
-          {/* Concentric pulsing ripples radiating from the pointer tip */}
-          <circle cx="0" cy="0" r="18" fill="none" stroke="#ff1744" strokeWidth="1.4">
-            <animate attributeName="r" values="4;22;4" dur="1.8s" repeatCount="indefinite" />
-            <animate attributeName="opacity" values="0.85;0.05;0.85" dur="1.8s" repeatCount="indefinite" />
-          </circle>
-          <circle cx="0" cy="0" r="10" fill="none" stroke="#ff5252" strokeWidth="1.2">
-            <animate attributeName="r" values="3;13;3" dur="1.8s" repeatCount="indefinite" />
-            <animate attributeName="opacity" values="0.9;0.15;0.9" dur="1.8s" repeatCount="indefinite" />
-          </circle>
-
-          {/* Teacher Cursor Pointer Arrow (pointing directly with tip at 0, 0) */}
-          <path
-            d="M 0 0 L 0 17 L 4.5 12.5 L 8.5 21 L 11.5 19.5 L 7.5 11 L 13.5 11 Z"
-            fill="#0f1117"
-            stroke="#ff1744"
-            strokeWidth="1.6"
-            strokeLinejoin="round"
-            filter="drop-shadow(0 2px 8px rgba(0, 0, 0, 0.75))"
-          />
-          {/* Inner cursor highlight */}
-          <path
-            d="M 1.5 2.5 L 1.5 14 L 4.5 11 L 8.5 18.5 L 9.8 17.8 L 6.2 10 L 11 10 Z"
-            fill="#ffffff"
-            opacity="0.9"
-          />
-
-          {/* High-intensity Ruby Laser Dot at the exact pointer tip */}
-          <circle cx="0" cy="0" r="6" fill="#ff1744" opacity="0.5" filter="url(#laser-dot-glow)" />
-          <circle cx="0" cy="0" r="3.8" fill="#ff0033" filter="url(#laser-dot-glow)" />
-          <circle cx="0" cy="0" r="1.6" fill="#ffffff" />
+        {overlay.target.kind === "region" && <path d={focusPath} fill="#67e8f9" fillOpacity="0.09" stroke="#67e8f9" strokeOpacity="0.7" strokeWidth="1.5" strokeDasharray="5 4" />}
+        {overlay.target.kind === "card" && <path d={focusPath} fill="#a78bfa" fillOpacity="0.06" stroke="#a78bfa" strokeOpacity="0.85" strokeWidth="2.5" strokeDasharray="8 5" />}
+        {activeCue?.kind === "arrow" && curvePath && <path d={curvePath} fill="none" stroke="#67e8f9" strokeWidth="3" strokeDasharray="8 6" strokeLinecap="round" markerEnd={`url(#${markerId}-arrow)`} mask={`url(#${markerId}-reveal)`} />}
+        {drawingPath && <path key={drawingKey} d={drawingPath} fill="none" stroke="#fef08a" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" pathLength="1" strokeDasharray="1" strokeDashoffset="0">
+          {!reducedMotion && <animate attributeName="stroke-dashoffset" from="1" to="0" dur="0.55s" fill="freeze" />}
+        </path>}
+        <circle cx={pointer.x} cy={pointer.y} r="8" fill="#fb7185" fillOpacity="0.18" />
+        <circle cx={pointer.x} cy={pointer.y} r="3.5" fill="#fda4af" stroke="white" strokeWidth="1" />
+        <g transform={`translate(${Math.max(8, Math.min(overlay.width - Math.min(280, overlay.target.label.length * 7 + 22) - 8, pointer.x + 16))}, ${Math.max(28, Math.min(overlay.height - 16, pointer.y - 18))})`}>
+          <rect x="0" y="-18" width={Math.min(280, overlay.target.label.length * 7 + 22)} height="27" rx="8" fill="#0f172a" fillOpacity="0.95" stroke="#67e8f9" strokeOpacity="0.6" />
+          <text x="10" y="0" fill="#f1f5f9" fontSize="12" fontFamily="system-ui, sans-serif"><title>{overlay.target.label}</title>{overlay.target.label.length > 36 ? `${overlay.target.label.slice(0, 35)}…` : overlay.target.label}</text>
         </g>
-
-        {/* Floating Live Guide Pill - informs the user what is currently being explained */}
-        {regionBadge && (
-          <g transform={`translate(${Math.round(laserPos.x + 20)}, ${Math.round(laserPos.y - 18)})`}>
-            <rect
-              x="0"
-              y="-13"
-              width={Math.max(92, regionBadge.length * 7.5 + 32)}
-              height="26"
-              rx="13"
-              fill="rgba(15, 17, 23, 0.94)"
-              stroke="#ff1744"
-              strokeWidth="1.4"
-              filter="drop-shadow(0 2px 8px rgba(255, 23, 68, 0.45))"
-            />
-            {/* Pulsing red live tracking dot */}
-            <circle cx="12" cy="0" r="3.5" fill="#ff1744">
-              <animate attributeName="opacity" values="1;0.35;1" dur="1s" repeatCount="indefinite" />
-            </circle>
-            <text
-              x="22"
-              y="4"
-              fill="#ffffff"
-              fontSize="11"
-              fontFamily="system-ui, -apple-system, sans-serif"
-              fontWeight="600"
-              letterSpacing="0.02em"
-            >
-              {regionBadge}
-            </text>
-          </g>
-        )}
       </svg>
     )}
     {imageNotice && <p role="status" className="absolute bottom-12 left-3 right-3 rounded-lg bg-[#24272d] px-3 py-2 text-xs text-[#e9bd92]">{imageNotice}</p>}

@@ -8,6 +8,31 @@ async function database() {
   });
 }
 export async function loadImageBlob(id: string, url: string, signal: AbortSignal): Promise<Blob> {
+  // Locally compiled SVG plots, scientific graphs, user/generated pixels never go through the remote proxy.
+  if (url.startsWith("data:")) {
+    if (url.length > 25_000_000) throw new Error("Image is too large");
+    try {
+      const response = await fetch(url, { signal });
+      return await response.blob();
+    } catch {
+      // Fallback manual data URL parser in case fetch(data:) encounters browser quirks
+      const match = url.match(/^data:([^;,]+)?(?:;(base64))?,(.*)$/);
+      if (match) {
+        const mimeType = match[1] || "image/png";
+        const isBase64 = match[2] === "base64";
+        const data = match[3];
+        if (isBase64) {
+          const binary = atob(data);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+          return new Blob([bytes], { type: mimeType });
+        } else {
+          return new Blob([decodeURIComponent(data)], { type: mimeType });
+        }
+      }
+      throw new Error("Invalid data URL");
+    }
+  }
   let db: IDBDatabase | undefined;
   try {
     db = await database();

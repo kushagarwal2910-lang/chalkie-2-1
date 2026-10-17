@@ -417,9 +417,41 @@ export function formatMathFormula(raw: string): string {
   // 4. LaTeX text wrappers: \text{...}, \mathrm{...}, \mathbf{...}, \operatorname{...}
   s = s.replace(/\\(?:text|mathrm|mathbf|mathit|mathsf|mathtt|operatorname)\{([^{}]+)\}/g, "$1");
 
-  // Blackboard bold & Calligraphic: \mathbb{R} -> ℝ, \mathcal{N} -> N
-  s = s.replace(/\\mathbb\{([A-Z])\}/g, (_, ch) => BB_MAP[ch] || ch);
-  s = s.replace(/\\mathcal\{([A-Z])\}/g, (_, ch) => CAL_MAP[ch] || ch);
+  // 4b. Convert plain-text sqrt(...) to \sqrt{...} for universal root formatting
+  let matchSqrt: RegExpExecArray | null;
+  const sqrtRegex = /\bsqrt\s*\(/i;
+  let safetySqrt = 0;
+  while ((matchSqrt = sqrtRegex.exec(s)) !== null && safetySqrt++ < 20) {
+    const startIdx = matchSqrt.index;
+    const argStart = startIdx + matchSqrt[0].length;
+    let depth = 1;
+    let endIdx = -1;
+    for (let i = argStart; i < s.length; i++) {
+      if (s[i] === "(") depth++;
+      else if (s[i] === ")") {
+        depth--;
+        if (depth === 0) { endIdx = i; break; }
+      }
+    }
+    if (endIdx === -1) break;
+    const inner = s.slice(argStart, endIdx);
+    s = s.slice(0, startIdx) + `\\sqrt{${inner}}` + s.slice(endIdx + 1);
+  }
+
+  // Convert multiplication asterisks between variables/numbers: e.g. 2*G*M -> 2GM, r*c^2 -> rc²
+  let prevS = "";
+  let loopCount = 0;
+  while (prevS !== s && loopCount++ < 10) {
+    prevS = s;
+    s = s.replace(/(\d+)\s*\*\s*([A-Za-z])/g, "$1$2");
+    s = s.replace(/([A-Za-z])\s*\*\s*([A-Za-z])/g, "$1$2");
+    s = s.replace(/([0-9a-zA-Z])\s*\*\s*([0-9a-zA-Z])/g, "$1·$2");
+  }
+
+  // Clean mathematical minus sign
+  s = s.replace(/([0-9a-zA-Z)\]])\s*-\s*([0-9a-zA-Z(\[])/g, "$1 − $2");
+  // Clean redundant parentheses in denominator e.g. / (rc²) -> / rc²
+  s = s.replace(/\/\s*\(\s*([a-zA-Z0-9²³·]+)\s*\)/g, " / $1");
 
   // 5. Balanced Fractions & Roots (handles arbitrary nested braces)
   s = replaceFractions(s);
@@ -496,4 +528,146 @@ export function isMathematicalFormula(text: string): boolean {
   if (/_[0-9a-zA-Z]/.test(text)) return true;
   if (/\b[NnPpEe]\s*\([^\)]+,\s*[^\)]+\)/.test(text)) return true;
   return false;
+}
+
+/**
+ * Formats on-screen subtitles so that mathematical equations appear as clean,
+ * human-readable Unicode symbols (e.g. √(1 − 2GM / rc²)) instead of raw code syntax,
+ * while stripping machine IDs and markdown markers.
+ */
+export function formatSubtitleForDisplay(text: string): string {
+  if (!text) return "";
+  let s = text;
+  // Strip "Beat / Step / Stage" meta-labels
+  s = s.replace(/\b(?:Beat|Step|Stage)\s+(?:one|two|three|four|five|six|\d+)\s*[:,.\-—]?\s*/gi, "");
+  s = s.replace(/\b(?:Step|Phase|Part)\s+\d+\s*[:,.\-—]\s*/gi, "");
+
+  // 1. Remove parenthetical or bracketed node IDs e.g. (n1), (n2), [node-1]
+  s = s.replace(/\s*\([a-zA-Z0-9_-]*(?:node|step|n)\d+[a-zA-Z0-9_-]*\)/gi, "");
+  s = s.replace(/\s*\[[a-zA-Z0-9_-]*(?:node|step|n)\d+[a-zA-Z0-9_-]*\]/gi, "");
+  s = s.replace(/\b(?:node[-_]?)?n[1-9]\d*\b/gi, "");
+  s = s.replace(/\bnode[-_]\d+\b/gi, "");
+
+  // 2. Format embedded code math formulas: sqrt(...) or \sqrt{...}
+  let matchSqrt: RegExpExecArray | null;
+  const sqrtRegex = /\bsqrt\s*\(/i;
+  let safetySqrt = 0;
+  while ((matchSqrt = sqrtRegex.exec(s)) !== null && safetySqrt++ < 15) {
+    const startIdx = matchSqrt.index;
+    const argStart = startIdx + matchSqrt[0].length;
+    let depth = 1;
+    let endIdx = -1;
+    for (let i = argStart; i < s.length; i++) {
+      if (s[i] === "(") depth++;
+      else if (s[i] === ")") {
+        depth--;
+        if (depth === 0) { endIdx = i; break; }
+      }
+    }
+    if (endIdx === -1) break;
+    const fullExpr = s.slice(startIdx, endIdx + 1);
+    const formatted = formatMathFormula(fullExpr);
+    s = s.slice(0, startIdx) + formatted + s.slice(endIdx + 1);
+  }
+
+  // Also format LaTeX equations inside $$...$$ or $...$
+  s = s.replace(/\$\$([\s\S]*?)\$\$/g, (_, eq) => formatMathFormula(eq));
+  s = s.replace(/\$([^\$\n]+)\$/g, (_, eq) => formatMathFormula(eq));
+
+  // 3. Strip remaining markdown formatting symbols
+  s = s.replace(/\*{1,3}([^*]+)\*{1,3}/g, "$1");
+  s = s.replace(/_{1,3}([^_]+)_{1,3}/g, "$1");
+  s = s.replace(/`([^`]+)`/g, "$1");
+  s = s.replace(/[*#~_`^]/g, "");
+
+  return s.replace(/\s+([,.!?])/g, "$1").replace(/\s{2,}/g, " ").trim();
+}
+
+/**
+ * Formats mathematical formulas inside Excalidraw / whiteboard card labels.
+ * Automatically converts raw LaTeX (\sqrt{...}, \frac{a}{b}, ^2, \times, \approx)
+ * into clean, publication-grade Unicode math symbols (√, ², ³, ≈, →, ×, Δ, π, θ).
+ */
+export function formatCardMathForCanvas(label: string): string {
+  if (!label) return "";
+  let s = label;
+
+  // Strip dollar delimiters
+  s = s.replace(/\$\$([\s\S]*?)\$\$/g, "$1");
+  s = s.replace(/\$([^\$\n]+)\$/g, "$1");
+
+  // LaTeX fractions: \frac{a}{b} -> (a / b) or a / b
+  let safetyFrac = 0;
+  while (/\\(?:d?frac)\s*\{([^{}]+)\}\s*\{([^{}]+)\}/.test(s) && safetyFrac++ < 12) {
+    s = s.replace(/\\(?:d?frac)\s*\{([^{}]+)\}\s*\{([^{}]+)\}/g, "($1 / $2)");
+  }
+
+  // LaTeX roots: \sqrt[3]{x} -> ³√(x), \sqrt{x} -> √(x)
+  let safetySqrt = 0;
+  while (/\\sqrt\s*\[(\d+)\]\s*\{([^{}]+)\}/.test(s) && safetySqrt++ < 10) {
+    s = s.replace(/\\sqrt\s*\[(\d+)\]\s*\{([^{}]+)\}/g, (_, root, inner) => {
+      const sup = root === "3" ? "³" : root === "4" ? "⁴" : `^${root}`;
+      return `${sup}√(${inner})`;
+    });
+  }
+  while (/\\sqrt\s*\{([^{}]+)\}/.test(s) && safetySqrt++ < 20) {
+    s = s.replace(/\\sqrt\s*\{([^{}]+)\}/g, "√($1)");
+  }
+  // Plain-text sqrt(...)
+  s = s.replace(/\bsqrt\s*\(([^)]+)\)/gi, "√($1)");
+
+  // Common LaTeX math symbols to Unicode
+  s = s.replace(/\\times\b|\\cdot\b/g, "×");
+  s = s.replace(/\\approx\b/g, "≈");
+  s = s.replace(/\\neq\b/g, "≠");
+  s = s.replace(/\\leq?\b/g, "≤");
+  s = s.replace(/\\geq?\b/g, "≥");
+  s = s.replace(/\\pm\b/g, "±");
+  s = s.replace(/\\rightarrow\b|\\to\b/g, "→");
+  s = s.replace(/\\Rightarrow\b|\\implies\b/g, "⇒");
+  s = s.replace(/\\Delta\b/g, "Δ");
+  s = s.replace(/\\pi\b/g, "π");
+  s = s.replace(/\\theta\b/g, "θ");
+  s = s.replace(/\\omega\b/g, "ω");
+  s = s.replace(/\\lambda\b/g, "λ");
+  s = s.replace(/\\alpha\b/g, "α");
+  s = s.replace(/\\beta\b/g, "β");
+  s = s.replace(/\\gamma\b/g, "γ");
+  s = s.replace(/\\mu\b/g, "μ");
+  s = s.replace(/\\sigma\b/g, "σ");
+  s = s.replace(/\\rho\b/g, "ρ");
+  s = s.replace(/\\tau\b/g, "τ");
+  s = s.replace(/\\infty\b/g, "∞");
+  s = s.replace(/\\partial\b/g, "∂");
+  s = s.replace(/\\nabla\b/g, "∇");
+  s = s.replace(/\\quad\b|\\qquad\b/g, "  ");
+  s = s.replace(/\\(?:text|mathrm|mathbf|mathit)\s*\{([^{}]+)\}/g, "$1");
+
+  // Superscripts
+  s = s.replace(/\^2\b|\^\{2\}/g, "²");
+  s = s.replace(/\^3\b|\^\{3\}/g, "³");
+  s = s.replace(/\^4\b|\^\{4\}/g, "⁴");
+  s = s.replace(/\^0\b|\^\{0\}/g, "⁰");
+  s = s.replace(/\^1\b|\^\{1\}/g, "¹");
+  s = s.replace(/\^\{-1\}/g, "⁻¹");
+
+  // Subscripts
+  s = s.replace(/_\{?([0-9a-zA-Z]{1,4})\}?/g, (match, sub) => {
+    if (sub === "orb") return "_orb";
+    if (sub === "esc") return "_esc";
+    if (sub === "0") return "₀";
+    if (sub === "1") return "₁";
+    if (sub === "2") return "₂";
+    if (sub === "3") return "₃";
+    return `_${sub}`;
+  });
+
+  // Strip remaining stray backslashes
+  s = s.replace(/\\([a-zA-Z]+)/g, "$1");
+  s = s.replace(/\\/g, "");
+
+  // Clean markdown asterisks
+  s = s.replace(/\*\*([^*]+)\*\*/g, "$1");
+
+  return s;
 }

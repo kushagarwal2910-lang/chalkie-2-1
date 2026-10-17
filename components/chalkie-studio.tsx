@@ -51,6 +51,16 @@ import { PROVIDER_CONFIGURATION_EVENT, PROVIDER_STATUS_EVENT, ProviderControl, p
 import { newestProviderQuota, parseProviderFailure, providerFailureError, providerKeysetIdentity, providerRetryReducer, providerRetryView, quotaMatchesConfiguration, sanitizeProviderQuota, type ProviderRetryState } from "@/lib/provider-retry";
 import { readProviderEventStream } from "@/lib/provider-event-stream";
 import { ChalkieIcon } from "@/components/chalkie-icon";
+import { SourceInput } from "@/components/source-input";
+import type { SourceMaterial } from "@/lib/source-materials";
+import { saveSourceMaterials, loadSourceMaterials } from "@/lib/source-storage";
+import { SourceSessionGuard } from "@/lib/source-session";
+import { LessonEntryGuard } from "@/lib/lesson-entry";
+import { LessonLanguageControl } from "@/components/lesson-language-control";
+import { defaultLessonLanguage, readLessonLanguage, isEnglishLessonLanguage, getMatchingDeviceVoice, LANGUAGE_OPTIONS, type LessonLanguageSettings } from "@/lib/lesson-language";
+import { generateRemoteSpeech, readRemoteSpeechPreference, SARVAM_LANGUAGE_CODES, type SpeechWordTiming } from "@/lib/remote-speech";
+import { splitNarrationAtCuePositions, playNarrationPhrases, playDeviceNarrationPhrases } from "@/lib/phrase-playback";
+import type { TeachingCue } from "@/lib/teaching-focus";
 import { VoiceSettingsDialog } from "@/components/voice-settings-dialog";
 import { demoLesson } from "@/lib/demo-v2";
 import { applyElkLayout } from "@/lib/elk-spatial-layout";
@@ -58,7 +68,8 @@ import { TeacherAvatar, useAvatarStyle } from "@/components/teacher-avatar";
 import { StudioWorkspace } from "@/components/studio-workspace";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { formatNarrationForSpeech } from "@/lib/speech-formatter";
-import { generateLocalSpeech, readLocalVoice, readSpeechEngine, sanitizeNarrationForSpeech } from "@/lib/local-speech";
+import { formatSubtitleForDisplay } from "@/lib/math-formatter";
+import { generateLocalSpeech, readLocalVoice, readSpeechEngine, sanitizeNarrationForSpeech, warmupLocalSpeech } from "@/lib/local-speech";
 import { computeTargetPositions } from "@/lib/target-matcher";
 import { getProgressiveVisibleObjects } from "@/lib/progressive-scene";
 import { CanvasPlaybackGate, playDeviceNarration, playRecordedNarration, type CanvasPlaybackState } from "@/lib/playback-sync";
@@ -151,10 +162,122 @@ function isLikelyNewTopic(q: string, current: LessonPlan): boolean {
 export function ChalkieStudio() {
   const searchParams = useSearchParams();
   const [avatarStyle] = useAvatarStyle();
+  const [sourceImporting, setSourceImporting] = useState(false);
+  const [sourceRestoring, setSourceRestoring] = useState(true);
+  const sourceSessionGuard = useRef(new SourceSessionGuard());
+  const [sourceMaterials, setSourceMaterials] = useState<SourceMaterial[]>([]);
+  const [includeWebSearch, setIncludeWebSearch] = useState(true);
+  const [languageSettings, setLanguageSettings] = useState<LessonLanguageSettings>(defaultLessonLanguage);
+  const [activeCue, setActiveCue] = useState<TeachingCue | null>(null);
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      // A lesson restored before this callback already carries its own language.
+      setLanguageSettings(current => current === defaultLessonLanguage ? readLessonLanguage() : current);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
   const [lesson, setLesson] = useState<LessonPlan>(emptyLesson);
+  const [translatedStepNarrations, setTranslatedStepNarrations] = useState<Record<number, string>>({});
+  const [isTranslating, setIsTranslating] = useState(false);
+  const translationCacheRef = useRef<Map<string, string>>(new Map());
+  const stepAudioCacheRef = useRef<Map<string, { audio: Blob; alignment: SpeechWordTiming[] }>>(new Map());
+  const stepAudioPrefetchRef = useRef<Map<string, Promise<{ audio: Blob; alignment: SpeechWordTiming[] } | null>>>(new Map());
+  const activeStepRef = useRef(0);
+
+  useEffect(() => {
+    stepAudioCacheRef.current.clear();
+    stepAudioPrefetchRef.current.clear();
+  }, [lesson.id, languageSettings]);
+
+  useEffect(() => {
+    warmupLocalSpeech(readLocalVoice(avatarStyle));
+  }, [avatarStyle]);
+
+  const getOrTranslateNarration = useCallback(async (
+    text: string,
+    targetSettings: LessonLanguageSettings,
+    signal?: AbortSignal
+  ): Promise<string> => {
+    if (isEnglishLessonLanguage(targetSettings) || !text.trim()) {
+      return text;
+    }
+    const key = `${targetSettings.language}:${targetSettings.mode}:${text}`;
+    const cached = translationCacheRef.current.get(key);
+    if (cached) return cached;
+
+    try {
+      const res = await fetch("/api/translate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal,
+        body: JSON.stringify({
+          text,
+          targetLanguage: targetSettings.language,
+          mode: targetSettings.mode,
+          avatar: avatarStyle,
+        }),
+      });
+      if (!res.ok) return text;
+      const data = await res.json();
+      if (data.translatedText && typeof data.translatedText === "string") {
+        const clean = data.translatedText;
+        translationCacheRef.current.set(key, clean);
+        return clean;
+      }
+    } catch {
+      // fallback to original text if translation failed or was aborted
+    }
+    return text;
+  }, [avatarStyle]);
+
+  useEffect(() => {
+    if (isEnglishLessonLanguage(languageSettings) || !lesson.segments?.length) {
+      setTranslatedStepNarrations({});
+      setIsTranslating(false);
+      return;
+    }
+
+    let cancelled = false;
+    const controller = new AbortController();
+    setIsTranslating(true);
+
+    async function translateSteps() {
+      try {
+        const currentActive = activeStepRef.current;
+        const total = lesson.segments.length;
+        const prioritizedIndices: number[] = [];
+        if (currentActive >= 0 && currentActive < total) prioritizedIndices.push(currentActive);
+        for (let i = currentActive + 1; i < total; i++) prioritizedIndices.push(i);
+        for (let i = 0; i < currentActive; i++) prioritizedIndices.push(i);
+
+        for (const i of prioritizedIndices) {
+          if (cancelled) break;
+          const original = lesson.segments[i]?.narration;
+          if (!original) continue;
+          const translated = await getOrTranslateNarration(original, languageSettings, controller.signal);
+          if (cancelled) break;
+          setTranslatedStepNarrations(prev => ({ ...prev, [i]: translated }));
+          if (i !== currentActive) {
+            await new Promise(r => setTimeout(r, 100));
+          }
+        }
+      } finally {
+        if (!cancelled) setIsTranslating(false);
+      }
+    }
+
+    void translateSteps();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      setIsTranslating(false);
+    };
+  }, [languageSettings, lesson.id, lesson.segments, getOrTranslateNarration]);
   const [promptMode, setPromptMode] = useState<"auto" | "doubt" | "new">("auto");
   const [isPlaying, setIsPlaying] = useState(false);
   const [activeStep, setActiveStep] = useState(0);
+  activeStepRef.current = activeStep;
   // null shows the completed board; -1 stages the first scene without revealing it.
   const [revealedStep, setRevealedStep] = useState<number | null>(null);
   const [visualSegment, setVisualSegment] = useState<LessonSegment | null>(null);
@@ -225,9 +348,8 @@ export function ChalkieStudio() {
     window.localStorage.setItem("chalkie:session", value);
     return value;
   });
-  const handledQuestionRef = useRef<string | null>(null);
+  const lessonEntryRef = useRef(new LessonEntryGuard());
   const handledLessonIdRef = useRef<string | null>(null);
-  const initialLoadDoneRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUrlRef = useRef<string | null>(null);
@@ -248,8 +370,8 @@ export function ChalkieStudio() {
   });
   const displaySources = lesson.sources.filter((source) => `${source.title} ${source.publisher}`.toLowerCase().includes(sourceQuery.toLowerCase()));
   const hasLesson = lesson.segments.length > 0;
-  const isBusy = isGenerating || isFollowUpGenerating || voiceState === "transcribing";
-  const canSubmitPrompt = prompt.trim().length >= (hasLesson && promptMode !== "new" ? 2 : 3) && !isBusy;
+  const isBusy = isGenerating || isFollowUpGenerating || sourceRestoring || voiceState === "transcribing";
+  const canSubmitPrompt = prompt.trim().length >= (hasLesson && promptMode !== "new" ? 2 : 3) && !isBusy && !sourceImporting;
   const retryView = providerRetryView(retryState.failure, providerQuota, retryNow);
   const showProviderBanner = retryState.status === "failed" || providerQuota?.allUnavailable;
   const totalDuration = Math.round(lesson.segments.reduce((total, segment) => total + segment.durationMs, 0) / 1000);
@@ -303,17 +425,43 @@ export function ChalkieStudio() {
     }
   }, []);
 
+  function beginSourceTransition(restoring: boolean) {
+    const revision = sourceSessionGuard.current.begin(restoring);
+    setSourceRestoring(restoring);
+    return revision;
+  }
+
+  function finishSourceTransition(revision: number) {
+    if (sourceSessionGuard.current.finish(revision)) setSourceRestoring(false);
+  }
+
+  async function restoreLessonSources(stored: LessonPlan | null, revision: number, fallbackSession = sessionId) {
+    const restoredSession = stored?.sourceSessionId ?? stored?.id ?? fallbackSession;
+    const saved = await loadSourceMaterials(restoredSession).catch(() => null);
+    if (!sourceSessionGuard.current.isCurrent(revision)) return false;
+    setSourceMaterials(saved?.materials ?? []);
+    setIncludeWebSearch(saved?.includeWebSearch ?? true);
+    setSessionId(restoredSession);
+    window.localStorage.setItem("chalkie:session", restoredSession);
+    if (stored?.language) setLanguageSettings(stored.language);
+    return true;
+  }
+
   useEffect(() => {
     const q = searchParams.get("q")?.trim() ?? "";
     const lessonId = searchParams.get("id")?.trim() ?? "";
     const isDemo = searchParams.get("demo") === "1";
 
     if (q.length >= 3) {
-      if (handledQuestionRef.current === q) return;
-      handledQuestionRef.current = q;
+      if (!lessonEntryRef.current.claimLaunch(q, searchParams.get("launch"))) return;
+      const sourceDraftId = searchParams.get("sources") || undefined;
 
       const params = new URLSearchParams(window.location.search);
       params.delete("q");
+      params.delete("launch");
+      params.delete("sources");
+      params.delete("id");
+      params.delete("demo");
       const suffix = params.toString();
       window.history.replaceState({}, "", `${window.location.pathname}${suffix ? `?${suffix}` : ""}`);
 
@@ -321,7 +469,6 @@ export function ChalkieStudio() {
       setSessionId(freshSessionId);
       if (typeof window !== "undefined") {
         window.localStorage.setItem("chalkie:session", freshSessionId);
-        window.localStorage.removeItem("chalkie:current-lesson");
       }
 
       setLesson(createEmptyLessonPlan(q));
@@ -329,47 +476,58 @@ export function ChalkieStudio() {
       setActiveStep(0);
       setVisualSegment(null);
       setActiveTargetId(null);
+    setActiveCue(null);
       setLastAnswer("");
       clearPendingProviderRequest();
       stopPlayback(true);
 
-      void generateLesson(q, freshSessionId);
+      // This mount effect runs before the saved-language state update is rendered.
+      void generateLesson(q, freshSessionId, readLessonLanguage(), true, sourceDraftId);
       return;
     }
 
     if (isDemo) {
       if (handledLessonIdRef.current === "demo") return;
       handledLessonIdRef.current = "demo";
-      void applyElkLayout(demoLesson).then((laid) => {
+      const revision = beginSourceTransition(true);
+      clearPendingProviderRequest();
+      stopPlayback(false);
+      void Promise.all([applyElkLayout(demoLesson).catch(() => demoLesson), restoreLessonSources(demoLesson, revision)]).then(([laid, restored]) => {
+        if (!restored || !sourceSessionGuard.current.isCurrent(revision)) return;
         setLesson(laid);
         setGenerationStage("Demo lesson loaded");
-      }).catch(() => {
-        setLesson(demoLesson);
-        setGenerationStage("Demo lesson loaded");
-      });
+      }).finally(() => finishSourceTransition(revision));
       return;
     }
 
     if (lessonId) {
       if (handledLessonIdRef.current === lessonId) return;
       handledLessonIdRef.current = lessonId;
-      void loadLessonById(lessonId).then((stored) => {
-        if (!stored) return;
+      const revision = beginSourceTransition(true);
+      clearPendingProviderRequest();
+      stopPlayback(false);
+      void loadLessonById(lessonId).then(async (stored) => {
+        if (!sourceSessionGuard.current.isCurrent(revision)) return;
+        if (!stored) { await restoreLessonSources(null, revision); return; }
+        if (!await restoreLessonSources(stored, revision)) return;
         try {
           setLesson(repairAndValidateLessonPlan(stored));
         } catch {
           setLesson(stored);
         }
         setGenerationStage("Lesson restored");
-      });
+      }).catch(() => undefined).finally(() => finishSourceTransition(revision));
       return;
     }
 
-    if (!initialLoadDoneRef.current) {
-      initialLoadDoneRef.current = true;
+    if (lessonEntryRef.current.claimRestore()) {
+      const entryGuard = lessonEntryRef.current;
+      const revision = beginSourceTransition(true);
+      const restoreGuard = sourceSessionGuard.current;
       let cancelled = false;
-      void loadCurrentLesson().then((stored) => {
-        if (cancelled || !stored) return;
+      void loadCurrentLesson().then(async (stored) => {
+        if (cancelled || !sourceSessionGuard.current.isCurrent(revision)) return;
+        if (!await restoreLessonSources(stored ?? null, revision) || cancelled || !stored) return;
         try {
           const repaired = repairAndValidateLessonPlan(stored);
           setLesson(repaired);
@@ -384,9 +542,13 @@ export function ChalkieStudio() {
             setGenerationStage("Lesson restored");
           }
         }
-      }).catch(() => undefined);
+      }).catch(() => undefined).finally(() => finishSourceTransition(revision));
 
-      return () => { cancelled = true; };
+      return () => {
+        cancelled = true;
+        entryGuard.retryRestore();
+        if (restoreGuard.isCurrent(revision)) restoreGuard.begin(true);
+      };
     }
   }, [searchParams]);
 
@@ -395,10 +557,13 @@ export function ChalkieStudio() {
       const params = new URLSearchParams(window.location.search);
       const targetId = params.get("id")?.trim() ?? "";
       if (targetId && targetId !== lesson.id) {
-        void loadLessonById(targetId).then((stored) => {
-          if (stored) {
-            clearPendingProviderRequest();
-            stopPlayback(false);
+        handledLessonIdRef.current = targetId;
+        const revision = beginSourceTransition(true);
+        clearPendingProviderRequest();
+        stopPlayback(false);
+        void loadLessonById(targetId).then(async (stored) => {
+          if (stored && sourceSessionGuard.current.isCurrent(revision)) {
+            if (!await restoreLessonSources(stored, revision)) return;
             setRevealedStep(null);
             try {
               setLesson(repairAndValidateLessonPlan(stored));
@@ -407,7 +572,7 @@ export function ChalkieStudio() {
             }
             setGenerationStage("Lesson restored");
           }
-        });
+        }).catch(() => undefined).finally(() => finishSourceTransition(revision));
       }
     };
     window.addEventListener("popstate", handleUrlChange);
@@ -510,6 +675,7 @@ export function ChalkieStudio() {
   }
 
   async function askQuestion(question: string) {
+    if (sourceSessionGuard.current.restoring || sourceImporting) { notify("Wait for your lesson sources to finish loading."); return; }
     const cleanQuestion = question.replace(/^(new|fresh|create|topic|start fresh|reset):\s*/i, "").trim();
     if (promptMode === "new") {
       await generateLesson(cleanQuestion);
@@ -526,24 +692,27 @@ export function ChalkieStudio() {
     }
   }
 
-  async function generateLesson(question: string, targetSessionId?: string) {
+  async function generateLesson(question: string, targetSessionId?: string, requestedLanguage = languageSettings, freshStart = false, sourceDraftId?: string) {
+    if (!freshStart && (sourceImporting || sourceSessionGuard.current.restoring)) { notify("Wait for your lesson sources to finish loading."); return; }
+    const sourceRevision = beginSourceTransition(Boolean(sourceDraftId));
+    let requestMaterials = freshStart ? [] : sourceMaterials;
+    let requestWebSearch = freshStart ? true : includeWebSearch;
+    if (freshStart) { setSourceMaterials([]); setIncludeWebSearch(true); }
     stopPlayback(true);
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
+    const current = () => abortRef.current === controller && !controller.signal.aborted && sourceSessionGuard.current.isCurrent(sourceRevision);
     const activeSessionId = targetSessionId || (typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `session-${Date.now()}`);
     setSessionId(activeSessionId);
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem("chalkie:session", activeSessionId);
-    }
     const requestId = beginProviderRequest({ kind: "lesson", question });
-    const current = () => abortRef.current === controller && !controller.signal.aborted;
 
     setLesson(createEmptyLessonPlan(question));
     setRevealedStep(null);
     setActiveStep(0);
     setVisualSegment(null);
     setActiveTargetId(null);
+    setActiveCue(null);
     setLastAnswer("");
     setIsGenerating(true);
     setIsFollowUpGenerating(false);
@@ -553,17 +722,36 @@ export function ChalkieStudio() {
     notify(`Preparing a visual lesson for “${question.slice(0, 34)}${question.length > 34 ? "…" : ""}”`);
 
     try {
+      if (sourceDraftId) {
+        const saved = await loadSourceMaterials(sourceDraftId);
+        if (!current()) return;
+        if (!saved) throw new Error("Your attached sources couldn’t load. Return home and attach them again.");
+        requestMaterials = saved.materials;
+        requestWebSearch = saved.includeWebSearch;
+        setSourceMaterials(requestMaterials);
+        setIncludeWebSearch(requestWebSearch);
+      }
+      finishSourceTransition(sourceRevision);
+      await saveSourceMaterials(activeSessionId, requestMaterials, requestWebSearch).catch(() => undefined);
+      if (!current()) return;
+      window.localStorage.setItem("chalkie:session", activeSessionId);
       const response = await fetch("/api/lesson", {
         method: "POST",
         signal: controller.signal,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, sessionId: activeSessionId, useWeb: true }),
+        body: JSON.stringify({ question, sessionId: activeSessionId, useWeb: requestWebSearch, sourceMaterials: requestMaterials, language: defaultLessonLanguage }),
       });
       if (!response.ok) throw providerFailureError(await response.json().catch(() => ({})), "The lesson connection could not be established");
       if (!response.body) throw new Error("The lesson connection could not be established");
       let generated: LessonPlan | undefined;
       await readProviderEventStream(response, (type, data) => {
         if (!current()) return;
+        if (type === "source_materials" && Array.isArray(data.materials)) {
+          const extracted = data.materials as {id:string;text:string}[];
+          requestMaterials = requestMaterials.map(material => { const found = extracted.find(item => item.id === material.id); return found && typeof found.text === "string" ? {...material,text:found.text} : material; });
+          setSourceMaterials(requestMaterials);
+          void saveSourceMaterials(activeSessionId, requestMaterials, requestWebSearch).catch(() => undefined);
+        }
         if (type === "status") setGenerationStage(String(data.message ?? "Working"));
         if (type === "provider_status") handleProviderStatus(data);
         if (type === "sources" && Array.isArray(data.sources)) {
@@ -572,7 +760,24 @@ export function ChalkieStudio() {
         }
         if (type === "lesson" && data.lesson) {
           if (data.mode === "demo") throw providerFailureError({ code: "PROVIDER_UNAVAILABLE", message: "A live lesson could not be generated. Check your provider keys and retry." });
-          generated = lessonPlanSchema.parse(data.lesson);
+          const rawLesson = data.lesson as any;
+          if (Array.isArray(rawLesson?.objects)) {
+            for (const obj of rawLesson.objects) {
+              if (obj.plot && (!obj.plot.kind || !obj.plot.title)) {
+                if (!obj.plotMetadata && (obj.plot.plotMetadata || obj.plot.xMin !== undefined)) {
+                  obj.plotMetadata = obj.plot.plotMetadata || {
+                    xMin: obj.plot.xMin,
+                    xMax: obj.plot.xMax,
+                    yMin: obj.plot.yMin,
+                    yMax: obj.plot.yMax,
+                    seriesSummary: obj.plot.seriesSummary,
+                  };
+                }
+                delete obj.plot;
+              }
+            }
+          }
+          generated = lessonPlanSchema.parse(rawLesson);
         }
         if (type === "error") {
           throw providerFailureError(data, "Lesson generation failed");
@@ -585,7 +790,7 @@ export function ChalkieStudio() {
       pendingAutoplayRef.current = 0;
       setIsPlaying(true);
       setRevealedStep(-1);
-      setLesson({ ...generated, id: `${generated.id.slice(0, 56)}-${Date.now()}` });
+      setLesson({ ...generated, sourceSessionId: activeSessionId, id: `${generated.id.slice(0, 56)}-${Date.now()}` });
       setActiveStep(0);
       setLastAnswer("");
       setGenerationStage("Lesson ready");
@@ -593,6 +798,7 @@ export function ChalkieStudio() {
     } catch (error) {
       if (current() && (error as Error).name !== "AbortError") failProviderRequest(requestId, error, "Lesson generation failed");
     } finally {
+      finishSourceTransition(sourceRevision);
       if (abortRef.current === controller) {
         setIsGenerating(false);
         if (pendingAutoplayRef.current === null && !playbackAbortRef.current) setVoiceState("idle");
@@ -601,12 +807,17 @@ export function ChalkieStudio() {
   }
 
   async function askFollowUp(question: string, currentLesson: LessonPlan = lesson) {
+    if (sourceImporting || sourceSessionGuard.current.restoring) { notify("Wait for your lesson sources to finish loading."); return; }
+    const sourceRevision = beginSourceTransition(false);
+    const requestSession = sessionId;
+    let requestMaterials = sourceMaterials;
+    const requestWebSearch = includeWebSearch;
     stopPlayback(true);
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
     const requestId = beginProviderRequest({ kind: "followup", question, currentLesson });
-    const current = () => abortRef.current === controller && !controller.signal.aborted;
+    const current = () => abortRef.current === controller && !controller.signal.aborted && sourceSessionGuard.current.isCurrent(sourceRevision);
     setIsFollowUpGenerating(true);
     setIsGenerating(false);
     setVoiceState("thinking");
@@ -619,13 +830,19 @@ export function ChalkieStudio() {
         method: "POST",
         signal: controller.signal,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question, sessionId, currentLesson }),
+        body: JSON.stringify({ question, sessionId: requestSession, currentLesson, sourceMaterials: requestMaterials, useWeb: requestWebSearch, language: defaultLessonLanguage }),
       });
       if (!response.ok) throw providerFailureError(await response.json().catch(() => ({})), "The follow-up connection could not be established");
       if (!response.body) throw new Error("The follow-up connection could not be established");
       let generated: ReturnType<typeof followUpPlanSchema.parse> | undefined;
       await readProviderEventStream(response, (type, data) => {
         if (!current()) return;
+        if (type === "source_materials" && Array.isArray(data.materials)) {
+          const extracted = data.materials as {id:string;text:string}[];
+          requestMaterials = requestMaterials.map(material => { const found = extracted.find(item => item.id === material.id); return found && typeof found.text === "string" ? {...material,text:found.text} : material; });
+          setSourceMaterials(requestMaterials);
+          void saveSourceMaterials(requestSession, requestMaterials, requestWebSearch).catch(() => undefined);
+        }
         if (type === "status") {
           const message = String(data.message ?? "Working");
           setGenerationStage(message);
@@ -640,7 +857,24 @@ export function ChalkieStudio() {
         }
         if (type === "followup" && data.plan) {
           if (data.mode === "demo") throw providerFailureError({ code: "PROVIDER_UNAVAILABLE", message: "A live answer could not be generated. Check your provider keys and retry." });
-          generated = followUpPlanSchema.parse(data.plan);
+          const rawPlan = data.plan as any;
+          if (Array.isArray(rawPlan?.objects)) {
+            for (const obj of rawPlan.objects) {
+              if (obj.plot && (!obj.plot.kind || !obj.plot.title)) {
+                if (!obj.plotMetadata && (obj.plot.plotMetadata || obj.plot.xMin !== undefined)) {
+                  obj.plotMetadata = obj.plot.plotMetadata || {
+                    xMin: obj.plot.xMin,
+                    xMax: obj.plot.xMax,
+                    yMin: obj.plot.yMin,
+                    yMax: obj.plot.yMax,
+                    seriesSummary: obj.plot.seriesSummary,
+                  };
+                }
+                delete obj.plot;
+              }
+            }
+          }
+          generated = followUpPlanSchema.parse(rawPlan);
         }
         if (type === "error") {
           throw providerFailureError(data, "Follow-up failed");
@@ -677,6 +911,7 @@ export function ChalkieStudio() {
     setIsPlaying(false);
     setVisualSegment(null);
     setActiveTargetId(null);
+    setActiveCue(null);
     setRevealedStep(null);
     setVoiceState("idle");
     audioRef.current?.pause();
@@ -696,6 +931,7 @@ export function ChalkieStudio() {
     const controller = new AbortController();
     playbackAbortRef.current = controller;
     const { signal } = controller;
+    const isCurrent = () => !signal.aborted && run === playbackRunRef.current;
     if (stepTimerRef.current) clearTimeout(stepTimerRef.current);
     audioRef.current?.pause();
     audioRef.current = null;
@@ -705,15 +941,39 @@ export function ChalkieStudio() {
     setRevealedStep((current) => current === null ? null : (current >= index ? index : current));
     setVoiceState("thinking");
 
-    const spokenNarration = sanitizeNarrationForSpeech(formatNarrationForSpeech(segment.narration));
-    const targetPositions = computeTargetPositions(spokenNarration, segment.targetIds, getProgressiveVisibleObjects(lesson, index, true), lesson.connections);
+    const playbackLanguage = languageSettings;
+    const english = isEnglishLessonLanguage(playbackLanguage);
+    let textToSpeak = segment.narration;
+    if (!english) {
+      if (translatedStepNarrations[index]) {
+        textToSpeak = translatedStepNarrations[index];
+      } else {
+        const targetName = LANGUAGE_OPTIONS.find(o => o.code === playbackLanguage.language)?.label || playbackLanguage.language;
+        setGenerationStage(`Translating narration into ${targetName}…`);
+        textToSpeak = await getOrTranslateNarration(segment.narration, playbackLanguage, signal);
+        if (!isCurrent()) return;
+        setTranslatedStepNarrations(prev => ({ ...prev, [index]: textToSpeak }));
+      }
+    }
+    // Keep a step's voice consistent even if preferences change in another tab.
+    const speechEngine = readSpeechEngine();
+    const remoteProvider = readRemoteSpeechPreference();
+    const preferences = readAvatarVoicePreferences(avatarStyle, window.localStorage);
+    const localVoice = readLocalVoice(avatarStyle);
+    const isIndian = !english && (playbackLanguage.language in SARVAM_LANGUAGE_CODES || playbackLanguage.language.endsWith("-IN"));
+    const effectiveEngine = english ? (speechEngine === "device" ? "device" : speechEngine === "remote" ? "remote" : "local") : "remote";
+    const effectiveProvider = isIndian ? "sarvam" : remoteProvider;
+    const speechText = (text: string) => sanitizeNarrationForSpeech(english ? formatNarrationForSpeech(text, playbackLanguage) : text, playbackLanguage);
+    const spokenNarration = speechText(textToSpeak);
+    const spokenCues = segment.cues?.map(cue => ({ ...cue, phrase: speechText(cue.phrase) }));
+    setActiveCue(null);
+    const targetPositions = computeTargetPositions(spokenNarration, segment.targetIds, getProgressiveVisibleObjects(lesson, index, true), lesson.connections, spokenCues);
     const initialTargetId = targetPositions[0]?.targetId
       ?? (segment.targetIds[0]?.includes("#") ? segment.targetIds[0] : null)
       ?? segment.targetIds[0]
       ?? null;
     setVisualSegment({ ...segment });
     setActiveTargetId(initialTargetId);
-    const isCurrent = () => !signal.aborted && run === playbackRunRef.current;
     const beginVisualTeaching = () => {
       if (!isCurrent()) return;
       setRevealedStep(index);
@@ -733,6 +993,8 @@ export function ChalkieStudio() {
       cues: targetPositions,
       onStart: beginVisualTeaching,
       onTarget: (targetId: string) => { if (isCurrent()) setActiveTargetId(targetId); },
+      onCue: (cue: TeachingCue | null) => { if (isCurrent()) setActiveCue(cue); },
+      wordTimings: [] as SpeechWordTiming[],
       onEnd: advance,
       onError: () => {
         if (!isCurrent()) return;
@@ -743,15 +1005,87 @@ export function ChalkieStudio() {
 
     try {
       let recording: Blob | null = null;
-      if (readSpeechEngine() === "local") {
-        const preferences = readAvatarVoicePreferences(avatarStyle, window.localStorage);
+      let wordTimings: SpeechWordTiming[] = [];
+      const phraseChunks = splitNarrationAtCuePositions(spokenNarration, targetPositions);
+      const hasPhraseCues = phraseChunks.some(chunk => chunk.cue);
+
+      const stepCacheKey = `${lesson.id}:${index}:${playbackLanguage.language}:${playbackLanguage.mode}:${avatarStyle}:${preferences.rate}:${spokenNarration}`;
+
+      let cached = stepAudioCacheRef.current.get(stepCacheKey);
+      if (!cached && stepAudioPrefetchRef.current.has(stepCacheKey)) {
+        const prefetched = await stepAudioPrefetchRef.current.get(stepCacheKey);
+        if (prefetched) cached = prefetched;
+      }
+
+      if (cached) {
+        recording = cached.audio;
+        wordTimings = cached.alignment;
+        callbacks.wordTimings = wordTimings;
+      } else if (effectiveEngine === "local") {
         setGenerationStage("Preparing your local voice…");
-        recording = await generateLocalSpeech(spokenNarration, readLocalVoice(avatarStyle), preferences.rate, signal, message => { if (isCurrent()) setGenerationStage(message); });
+        recording = await generateLocalSpeech(spokenNarration, localVoice, preferences.rate, signal, message => { if (isCurrent()) setGenerationStage(message); });
+        stepAudioCacheRef.current.set(stepCacheKey, { audio: recording, alignment: [] });
+      } else if (effectiveEngine === "remote") {
+        setGenerationStage("Preparing natural narration…");
+        try {
+          const remote = await generateRemoteSpeech(spokenNarration, playbackLanguage, preferences.rate, signal, effectiveProvider, avatarStyle);
+          stepAudioCacheRef.current.set(stepCacheKey, remote);
+          recording = remote.audio;
+          wordTimings = remote.alignment;
+          callbacks.wordTimings = wordTimings;
+        } catch (remoteErr) {
+          console.warn("Remote natural voice provider unavailable or failed, falling back silently to device speech:", remoteErr);
+          recording = null;
+        }
       }
       if (!isCurrent()) return;
 
-      // Request this exact step only after its audio has buffered. Wait for ELK,
-      // the editor, and the scene's first paint before starting either voice path.
+      const prefetchNextStep = (nextIndex: number) => {
+        if (nextIndex >= lesson.segments.length) return;
+        const nextSegment = lesson.segments[nextIndex];
+        if (!nextSegment) return;
+
+        void (async () => {
+          try {
+            let nextText = nextSegment.narration;
+            if (!english) {
+              nextText = translatedStepNarrations[nextIndex] || await getOrTranslateNarration(nextSegment.narration, playbackLanguage);
+            }
+            const nextSpoken = speechText(nextText);
+            const nextCacheKey = `${lesson.id}:${nextIndex}:${playbackLanguage.language}:${playbackLanguage.mode}:${avatarStyle}:${preferences.rate}:${nextSpoken}`;
+            if (stepAudioCacheRef.current.has(nextCacheKey) || stepAudioPrefetchRef.current.has(nextCacheKey)) return;
+
+            if (effectiveEngine === "local") {
+              const prefetchTask = generateLocalSpeech(nextSpoken, localVoice, preferences.rate, new AbortController().signal)
+                .then(audio => {
+                  const res = { audio, alignment: [] };
+                  stepAudioCacheRef.current.set(nextCacheKey, res);
+                  return res;
+                })
+                .catch(() => null)
+                .finally(() => {
+                  stepAudioPrefetchRef.current.delete(nextCacheKey);
+                });
+              stepAudioPrefetchRef.current.set(nextCacheKey, prefetchTask);
+            } else if (effectiveEngine === "remote") {
+              const prefetchTask = generateRemoteSpeech(nextSpoken, playbackLanguage, preferences.rate, undefined, effectiveProvider, avatarStyle)
+                .then(res => {
+                  stepAudioCacheRef.current.set(nextCacheKey, res);
+                  return res;
+                })
+                .catch(() => null)
+                .finally(() => {
+                  stepAudioPrefetchRef.current.delete(nextCacheKey);
+                });
+              stepAudioPrefetchRef.current.set(nextCacheKey, prefetchTask);
+            }
+          } catch {
+            // Ignore prefetch errors in background
+          }
+        })();
+      };
+
+      // Wait for ELK, the editor, and this scene's first paint before starting audio.
       const request = ++playbackRequestRef.current;
       setActiveStep(index);
       setPlaybackRequest(request);
@@ -763,22 +1097,41 @@ export function ChalkieStudio() {
         audioUrlRef.current = url;
         const audio = new Audio(url);
         audioRef.current = audio;
+        prefetchNextStep(index + 1);
         playRecordedNarration(audio, spokenNarration.length, callbacks);
         return;
       }
       if ("speechSynthesis" in window) {
-        const utterance = new SpeechSynthesisUtterance(spokenNarration);
         const voices = window.speechSynthesis.getVoices();
-        const preferences = readAvatarVoicePreferences(avatarStyle, window.localStorage);
-        utterance.voice = getBestAvailableVoice(voices, preferences.uri, avatarStyle);
-        utterance.lang = utterance.voice?.lang || "en-US";
-        utterance.rate = preferences.rate;
-        utterance.pitch = preferences.pitch;
-        playDeviceNarration(window.speechSynthesis, utterance, callbacks);
-      } else {
-        beginVisualTeaching();
-        stepTimerRef.current = setTimeout(advance, segment.durationMs || 4500);
+        const matchingVoices = voices.filter(voice => voice.lang.toLowerCase().replaceAll("_", "-").split("-")[0] === playbackLanguage.language.toLowerCase().split("-")[0]);
+        const voice = (english ? getBestAvailableVoice(matchingVoices, preferences.uri, avatarStyle) : getMatchingDeviceVoice(matchingVoices, playbackLanguage, preferences.uri))
+          || matchingVoices[0]
+          || voices.find(v => v.lang.toLowerCase().includes("in"))
+          || voices.find(v => v.lang.toLowerCase().startsWith("en"))
+          || voices[0];
+        if (voice) {
+          const createUtterance = (text: string) => {
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.voice = voice;
+            utterance.lang = voice.lang;
+            utterance.rate = preferences.rate;
+            utterance.pitch = preferences.pitch;
+            return utterance;
+          };
+          if (hasPhraseCues) {
+            await playDeviceNarrationPhrases({ chunks: phraseChunks, signal, speech: window.speechSynthesis, createUtterance,
+              onStart: beginVisualTeaching,
+              onCue: cue => { if (isCurrent()) { setActiveTargetId(cue.targetId); setActiveCue(cue); } },
+            });
+            if (isCurrent()) advance();
+          } else {
+            playDeviceNarration(window.speechSynthesis, createUtterance(spokenNarration), callbacks);
+          }
+          return;
+        }
       }
+      beginVisualTeaching();
+      stepTimerRef.current = setTimeout(advance, segment.durationMs || 4500);
     } catch (error) {
       if (!isCurrent()) return;
       stopPlayback(false);
@@ -982,12 +1335,21 @@ export function ChalkieStudio() {
               <DropdownMenuSeparator className="bg-[#363a40]" />
               <DropdownMenuItem onSelect={async () => {
                 if (!confirm("Clear this lesson, reset server research cache, and start fresh?")) return;
+                const revision = beginSourceTransition(true);
                 clearPendingProviderRequest();
                 stopPlayback(true);
                 await clearAllClientStorage();
+                if (!sourceSessionGuard.current.isCurrent(revision)) return;
+                setSourceMaterials([]);
+                setIncludeWebSearch(true);
+                const freshSession = crypto.randomUUID();
+                setSessionId(freshSession);
+                window.localStorage.setItem("chalkie:session", freshSession);
                 try { await fetch("/api/reset", { method: "POST" }); } catch { /* Keep local reset available offline. */ }
+                if (!sourceSessionGuard.current.isCurrent(revision)) return;
                 setLesson(emptyLesson);
                 setRevealedStep(null);
+                finishSourceTransition(revision);
                 notify("Workspace cleared");
               }} className="min-h-11 gap-3 rounded-lg text-[#f0aca9] focus:bg-[#493134] focus:text-[#ffd3d0]"><Trash2 size={16} /> Clear workspace</DropdownMenuItem>
             </DropdownMenuContent>
@@ -1025,18 +1387,19 @@ export function ChalkieStudio() {
             <aside className="studio-panel" aria-label="Lesson sources">
               <div className="studio-panel-heading"><h2><Layers3 size={17} /> Sources <span className="studio-count">{lesson.sources.length}</span></h2><button type="button" onClick={toggleLeftPanel} className="studio-icon-button studio-desktop-only" aria-label="Collapse Sources sidebar"><PanelLeftClose size={17} /></button></div>
               <div className="px-4 pb-4">
+                <SourceInput key={sessionId} sessionId={sessionId} hydrated={!sourceRestoring} materials={sourceMaterials} includeWebSearch={includeWebSearch} onMaterialsChange={materials => { if (!sourceSessionGuard.current.restoring) setSourceMaterials(materials); }} onImportingChange={setSourceImporting} onIncludeWebSearchChange={setIncludeWebSearch} disabled={isBusy} />
                 <label className="studio-search"><Search size={15} /><input value={sourceQuery} onChange={(event) => setSourceQuery(event.target.value)} placeholder="Find a source" aria-label="Search lesson sources" /></label>
               </div>
               <div className="studio-panel-scroll px-3">
                 {!displaySources.length && <div className="studio-empty-card"><FileText size={25} /><h3>{lesson.sources.length ? "No matching sources" : "A little context goes a long way"}</h3><p>{lesson.sources.length ? "Try a different title or publisher." : "Ask a question and the research behind your lesson will appear here."}</p></div>}
                 <div className="space-y-1">
-                  {displaySources.map((source, index) => <a key={`${source.id}-${source.url || index}`} href={source.url} target="_blank" rel="noopener noreferrer" className="studio-source" title={source.title}>
+                  {displaySources.map((source, index) => <a key={`${source.id}-${source.url || index}`} href={/^https?:\/\//.test(source.url) ? source.url : undefined} target="_blank" rel="noopener noreferrer" className="studio-source" title={source.title}>
                     <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-[#2d3037] ${sourceColors[index % sourceColors.length]}`}>{source.url.includes("youtube") ? <Play size={15} /> : <FileText size={15} />}</span>
                     <span className="min-w-0 flex-1"><span className="line-clamp-2 break-words text-sm font-medium leading-5 text-[#e5e6e1]">{source.title}</span><span className="mt-1 block truncate text-xs text-[#a9adb6]">{source.publisher}</span></span><ArrowUpRight size={14} className="mt-1 shrink-0 text-[#838994]" />
                   </a>)}
                 </div>
-                {lesson.objects.filter(o => o.image).map(o => <div key={o.id} className="image-credit"><a href={o.image!.sourceUrl} target="_blank" rel="noopener noreferrer">{o.label} · Image source ↗</a><p>{o.image!.author}</p><a href={o.image!.licenseUrl} target="_blank" rel="noopener noreferrer">{o.image!.license}</a><span> · Shown with teaching annotations</span></div>)}
-                {lesson.objects.filter(o => o.imageRequest && o.imageRequest.status !== "ready").map(o => <div key={o.id} className="image-credit" role="status"><p>{o.label}: {o.imageRequest!.status === "not_found" ? "No suitable free image was found." : o.imageRequest!.status === "rejected" ? "The reference did not pass the image check." : "Image search or vision is temporarily unavailable."} Teaching continues with text.</p></div>)}
+                {lesson.objects.filter(o => o.image).map(o => <div key={o.id} className="image-credit">{o.image!.provenance === "plot" || o.image!.provenance === "user" ? <p>{o.label} · {o.image!.provenance === "plot" ? "Computed graph" : "Your document"}</p> : <a href={o.image!.sourceUrl} target="_blank" rel="noopener noreferrer">{o.label} · {o.image!.provenance === "generated" ? "AI illustration · not evidence" : "Image source ↗"}</a>}<p>{o.image!.author}</p><span>{o.image!.license}</span></div>)}
+                {lesson.objects.filter(o => o.imageRequest && o.imageRequest.status !== "ready").map(o => <div key={o.id} className="image-credit" role="status"><p>{o.label}: {o.imageRequest!.reason || (o.imageRequest!.status === "not_found" ? "No suitable free image was found." : o.imageRequest!.status === "rejected" ? "The reference did not pass the image check." : "Image search or vision is temporarily unavailable.")} Teaching continues with text.</p></div>)}
                 {hasLesson && <button disabled={!lesson.question || isBusy} onClick={() => void generateLesson(lesson.question)} className="studio-secondary my-4 w-full gap-2 text-xs"><RotateCcw size={14} /> Refresh research</button>}
               </div>
               <div className="studio-panel-footer">
@@ -1153,6 +1516,7 @@ export function ChalkieStudio() {
                     isPresenting={isPlaying}
                     isSpeaking={voiceState === "speaking"}
                     activeTargetId={activeTargetId}
+                    activeCue={activeCue}
                     playbackRequest={playbackRequest}
                     onPlaybackState={handleCanvasPlaybackState}
                   />
@@ -1172,6 +1536,11 @@ export function ChalkieStudio() {
                           <span className="text-[11px] font-semibold uppercase tracking-wider text-[#c4b5fd] truncate">
                             {lesson.segments[activeStep]?.title || lesson.title}
                           </span>
+                          {!isEnglishLessonLanguage(languageSettings) && (
+                            <span className="rounded bg-[#383344] px-1.5 py-0.5 text-[9px] font-medium text-[#c4b5fd]">
+                              {LANGUAGE_OPTIONS.find(o => o.code === languageSettings.language)?.label || languageSettings.language}
+                            </span>
+                          )}
                           {voiceState === "speaking" && (
                             <span className="studio-theater-waveform flex items-center gap-0.5 ml-1" aria-hidden="true">
                               <span className="w-0.5 h-2.5 bg-[#c4b5fd] rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
@@ -1181,7 +1550,7 @@ export function ChalkieStudio() {
                           )}
                         </div>
                         <p className="mt-0.5 line-clamp-2 text-xs leading-relaxed text-[#e5e7eb] sm:text-sm">
-                          {lesson.segments[activeStep]?.narration || lesson.summary}
+                          {formatSubtitleForDisplay(translatedStepNarrations[activeStep] || lesson.segments[activeStep]?.narration || lesson.summary)}
                         </p>
                       </div>
                       <div className={`studio-theater-hud-pill ${theaterInputExpanded ? "is-expanded" : ""}`}>
@@ -1284,6 +1653,7 @@ export function ChalkieStudio() {
             <aside className="studio-panel" aria-label="Lesson guide">
               <div className="studio-panel-heading"><h2><BookOpen size={17} /> Lesson guide</h2><button type="button" onClick={toggleRightPanel} className="studio-icon-button studio-desktop-only" aria-label="Collapse Lesson Guide sidebar"><PanelRightClose size={17} /></button></div>
               <div className="studio-panel-scroll px-4">
+                <LessonLanguageControl value={languageSettings} onChange={setLanguageSettings} disabled={isBusy || isPlaying} />
                 <div className="studio-voice-card">
                   <div className="flex flex-wrap items-center justify-between gap-2"><span className="flex items-center gap-2 text-xs font-medium text-[#d4c8f2]"><Headphones size={15} /> Listen & learn</span><button type="button" onClick={() => { stopPlayback(false); setVoiceSettingsOpen(true); }} className="studio-icon-button h-8 min-h-8 w-8 text-[#d4c8f2]" aria-label="Voice settings" title="Voice settings"><SlidersHorizontal size={16} /></button></div>
                   <TeacherAvatar style={avatarStyle} speaking={voiceState === "speaking"} listening={isRecording} pointing={!!activeTargetId} className="teacher-in-guide" /><h3 className="mt-4 break-words text-lg font-medium leading-6 tracking-[-.02em]">{hasLesson ? lesson.title : "A lesson, at your pace"}</h3>
@@ -1299,7 +1669,7 @@ export function ChalkieStudio() {
                   const state = index < activeStep ? "done" : index === activeStep ? "active" : "next";
                   return <button key={step.id} disabled={!!canvasError} onClick={() => { setIsTheaterMode(true); const run = playbackRunRef.current + 1; playbackRunRef.current = run; setActiveStep(index); void playStep(index, run); }} aria-label={`Teach ${step.title}`} aria-current={state === "active" ? "step" : undefined} className="studio-step">
                     <span className={`studio-step-number ${state === "done" ? "bg-[#303d36] text-[#a9c9b0]" : state === "active" ? "bg-[#c4b5fd] text-[#292333]" : "bg-[#30343a] text-[#a9adb6]"}`}>{state === "done" ? <Check size={13} /> : String(index + 1).padStart(2, "0")}</span>
-                    <span className="min-w-0"><span className="block break-words text-sm font-medium leading-5">{step.title}</span><span className="mt-1.5 line-clamp-2 break-words text-xs leading-5 text-[#a9adb6]">{step.narration}</span></span>
+                    <span className="min-w-0"><span className="block break-words text-sm font-medium leading-5">{step.title}</span><span className="mt-1.5 line-clamp-2 break-words text-xs leading-5 text-[#a9adb6]">{formatSubtitleForDisplay(translatedStepNarrations[index] || step.narration)}</span></span>
                   </button>;
                 })}</div>
               </div>
@@ -1312,7 +1682,7 @@ export function ChalkieStudio() {
       <dialog ref={overviewRef} onCancel={() => setOverviewOpen(false)} onClose={() => setOverviewOpen(false)} aria-labelledby="overview-title" className="studio-overview">
         <div className="flex h-full min-h-0 flex-col"><div className="flex min-h-16 shrink-0 items-center justify-between gap-3 border-b border-[#363a40] px-4 sm:px-5"><div className="min-w-0"><h2 id="overview-title" className="text-sm font-medium">The complete picture</h2><p className="mt-1 text-xs text-[#a9adb6]">Explore and edit your full whiteboard.</p></div><button onClick={() => setOverviewOpen(false)} className="studio-icon-button" aria-label="Close overview"><X size={18} /></button></div><div className="relative m-2 min-h-0 flex-1 overflow-hidden rounded-xl sm:m-4">{overviewOpen && <ChalkCanvas lesson={lesson} activeSegment={null} activeStep={lesson.segments.length - 1} isPresenting={false} />}</div></div>
       </dialog>
-      <VoiceSettingsDialog open={voiceSettingsOpen} onOpenChange={setVoiceSettingsOpen} />
+      <VoiceSettingsDialog languageSettings={languageSettings} open={voiceSettingsOpen} onOpenChange={setVoiceSettingsOpen} />
       {toast && <div role="status" className="studio-toast"><Sparkles size={16} className="shrink-0 text-[#c4b5fd]" /><span className="min-w-0 flex-1 break-words">{toast}</span><button onClick={() => setToast(null)} className="studio-icon-button h-8 min-h-8 w-8" aria-label="Dismiss notification"><X size={15} /></button></div>}
     </main>
   );

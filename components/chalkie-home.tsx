@@ -9,6 +9,11 @@ import { repairAndValidateLessonPlan } from "@/lib/lesson-layout";
 import type { LessonPlan } from "@/lib/lesson-schema";
 import { ProviderControl } from "@/components/provider-control";
 import { ChalkieIcon } from "@/components/chalkie-icon";
+import { SourceInput } from "@/components/source-input";
+import type { SourceMaterial } from "@/lib/source-materials";
+import { loadSourceMaterials, saveSourceMaterials } from "@/lib/source-storage";
+
+const homeSourceDraft = "chalkie-home-draft";
 
 const startingPoints = [
   { category: "Everyday engineering", title: "A small push. A bigger force.", question: "How does a hydraulic system multiply force?" },
@@ -54,6 +59,13 @@ export function ChalkieHome() {
   const questionRef = useRef<HTMLInputElement>(null);
   const driveDialogRef = useRef<HTMLDialogElement>(null);
   const [question, setQuestion] = useState("");
+  const [sourceMaterials, setSourceMaterials] = useState<SourceMaterial[]>([]);
+  const [includeWebSearch, setIncludeWebSearch] = useState(true);
+  const [sourcesReady, setSourcesReady] = useState(false);
+  const [sourceImporting, setSourceImporting] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const startingRef = useRef(false);
+  const [launchError, setLaunchError] = useState("");
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState<"recent" | "title">("recent");
   const [recent, setRecent] = useState<LessonPlan[]>([]);
@@ -66,6 +78,9 @@ export function ChalkieHome() {
 
   useEffect(() => {
     let cancelled = false;
+    void loadSourceMaterials(homeSourceDraft).then(saved => {
+      if (!cancelled && saved) { setSourceMaterials(saved.materials); setIncludeWebSearch(saved.includeWebSearch); }
+    }).catch(() => undefined).finally(() => { if (!cancelled) setSourcesReady(true); });
     void Promise.all([loadRecentLessons(), loadCurrentLesson()]).then(([saved, current]) => {
       if (cancelled) return;
       const lessons = validLessons(current ? [current, ...saved] : saved);
@@ -122,16 +137,30 @@ export function ChalkieHome() {
     } finally { setClearing(false); }
   }
 
-  function begin(questionText: string) {
+  async function begin(questionText: string) {
     const value = questionText.trim();
-    if (value.length >= 3) {
-      if (typeof window !== "undefined") {
-        window.localStorage.removeItem("chalkie:current-lesson");
+    if (value.length < 3 || !sourcesReady || sourceImporting || startingRef.current) return;
+    startingRef.current = true;
+    setStarting(true);
+    setLaunchError("");
+    try {
+      const launchId = crypto.randomUUID();
+      const params = new URLSearchParams({ q: value, launch: launchId });
+      try {
+        // Snapshot before navigation; a pending draft autosave must not lose uploads.
+        await saveSourceMaterials(launchId, sourceMaterials, includeWebSearch);
+        params.set("sources", launchId);
+      } catch {
+        if (sourceMaterials.length || !includeWebSearch) throw new Error("Your sources couldn’t be saved for the new notebook. Free some browser storage and try again.");
       }
-      router.push(`/studio?q=${encodeURIComponent(value)}`);
+      router.push(`/studio?${params}`);
+    } catch (error) {
+      setLaunchError(error instanceof Error ? error.message : "The notebook couldn’t start. Please try again.");
+      startingRef.current = false;
+      setStarting(false);
     }
   }
-  function submit(event: FormEvent) { event.preventDefault(); begin(question); }
+  function submit(event: FormEvent) { event.preventDefault(); void begin(question); }
   async function openLesson(lesson: LessonPlan) {
     if (openingId) return;
     setOpeningId(lesson.id);
@@ -181,9 +210,13 @@ export function ChalkieHome() {
             </div>
             <div className="flex min-w-0 flex-1 flex-col gap-3 min-[480px]:flex-row min-[480px]:items-center">
               <input id="new-question" ref={questionRef} value={question} onChange={event => setQuestion(event.target.value)} maxLength={1000} placeholder="e.g. How does a neural network learn?" aria-label="Start a new visual lesson" className="h-12 min-w-0 flex-1 rounded-xl border border-[#363a40] bg-[#17191c] px-4 text-base text-[#f3f3ee] outline-none placeholder:text-[#9297a1] focus:border-[#c4b5fd] focus:ring-2 focus:ring-[#c4b5fd]/15 sm:text-sm" />
-              <button type="submit" disabled={question.trim().length < 3} className={`inline-flex h-12 shrink-0 items-center justify-center gap-2 rounded-full bg-[#c4b5fd] px-5 text-sm font-semibold text-[#25202e] transition-colors hover:bg-[#d2c7fc] disabled:cursor-not-allowed disabled:bg-[#403b4b] disabled:text-[#a9a1b8] ${focusRing}`}>Create notebook <ArrowRight size={16} /></button>
+              <button type="submit" disabled={question.trim().length < 3 || !sourcesReady || sourceImporting || starting} className={`inline-flex h-12 shrink-0 items-center justify-center gap-2 rounded-full bg-[#c4b5fd] px-5 text-sm font-semibold text-[#25202e] transition-colors hover:bg-[#d2c7fc] disabled:cursor-not-allowed disabled:bg-[#403b4b] disabled:text-[#a9a1b8] ${focusRing}`}>{starting ? "Opening notebook…" : sourceImporting ? "Reading source…" : "Create notebook"} <ArrowRight size={16} /></button>
             </div>
           </form>
+          {launchError && <p role="alert" className="mt-3 text-sm text-[#f1b7b4]">{launchError}</p>}
+          <div className="mt-4">
+            <SourceInput sessionId={homeSourceDraft} materials={sourceMaterials} includeWebSearch={includeWebSearch} onMaterialsChange={setSourceMaterials} onIncludeWebSearchChange={setIncludeWebSearch} onImportingChange={setSourceImporting} hydrated={sourcesReady} disabled={starting} initiallyOpen label="Your sources" />
+          </div>
           <p className="mt-3 text-xs leading-5 text-[#9297a1]">A visual lesson, an interactive whiteboard, and an explanation you can hear.</p>
         </section>
 

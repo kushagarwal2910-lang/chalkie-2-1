@@ -231,6 +231,7 @@ export async function applyElkLayout(rawPlan: LessonPlan, options: ElkLayoutOpti
     return {
       ...connection,
       route: "elbow",
+      arrowhead: "arrow",
       bend: 0,
       points,
       fromPort,
@@ -242,5 +243,28 @@ export async function applyElkLayout(rawPlan: LessonPlan, options: ElkLayoutOpti
       } : undefined,
     };
   });
+
+  // Spatial Zoning: ensure primary visual anchor or root layout aligns to focus zone (x: 64, y: 112)
+  const hero = objects.find(o => o.image);
+  const minX = Math.min(...objects.map(o => o.x));
+  const minY = Math.min(...objects.map(o => o.y));
+  const offsetX = hero ? (64 - hero.x) : (64 - minX);
+  const offsetY = hero ? (112 - hero.y) : (112 - minY);
+  if (offsetX !== 0 || offsetY !== 0) {
+    for (const obj of objects) {
+      obj.x += offsetX;
+      obj.y += offsetY;
+    }
+    for (const conn of connections) {
+      if (conn.points) {
+        conn.points = conn.points.map(p => ({ x: p.x + offsetX, y: p.y + offsetY }));
+      }
+      if (conn.labelPosition) {
+        conn.labelPosition.x += offsetX;
+        conn.labelPosition.y += offsetY;
+      }
+    }
+  }
+
   return { ...plan, objects, connections };
 }

@@ -1,6 +1,7 @@
 import type { FollowUpPlan, LessonPlan, LessonSegment, VisualConnection, VisualObject } from "./lesson-schema.ts";
 import { normalizeLessonLayout } from "./lesson-layout.ts";
 import { routeOrthogonalConnector } from "./connector-routing.ts";
+import { attachPlot } from "./plot-lesson.ts";
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 const safeId = (value: string, fallback: string) => value.trim().replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 56) || fallback;
@@ -61,6 +62,26 @@ function automaticAnchors(from: VisualObject, to: VisualObject) {
 
 export function mergeFollowUpLesson(current: LessonPlan, plan: FollowUpPlan): FollowUpMerge {
   const startIndex = current.segments.length;
+  // A URL has one canonical source identity. Existing plotted citations keep their IDs;
+  // incoming citations are remapped explicitly instead of being silently lost in URL deduplication.
+  const mergedSources = current.sources.map(source => ({ ...source }));
+  const sourceByUrl = new Map(mergedSources.map(source => [source.url, source]));
+  const usedSourceIds = new Set(mergedSources.map(source => source.id));
+  const sourceIdMap = new Map<string, string>();
+  for (const source of plan.sources ?? []) {
+    const canonical = sourceByUrl.get(source.url);
+    if (canonical) {
+      sourceIdMap.set(source.id, canonical.id);
+      Object.assign(canonical, source, { id: canonical.id });
+      continue;
+    }
+    const id = usedSourceIds.has(source.id) ? uniqueId(safeId(`${source.id}-followup`, "followup-source"), usedSourceIds) : source.id;
+    usedSourceIds.add(id);
+    const incoming = { ...source, id };
+    sourceIdMap.set(source.id, id);
+    sourceByUrl.set(source.url, incoming);
+    mergedSources.push(incoming);
+  }
   const existingIds = new Set(current.objects.map((object) => object.id));
   const usedObjectIds = new Set(existingIds);
   const room = Math.max(0, 72 - current.objects.length);
@@ -73,7 +94,18 @@ export function mergeFollowUpLesson(current: LessonPlan, plan: FollowUpPlan): Fo
   const preparedObjects = rawObjects.map((object, index) => {
     const id = uniqueId(safeId(`${prefix}-${safeId(object.id, `object-${index + 1}`)}`, `follow-object-${index + 1}`), usedObjectIds);
     idMap.set(object.id, id);
-    return { ...object, id };
+    const prepared = {
+      ...object,
+      id,
+      annotations: object.annotations?.map((ann, idx) => ({
+        ...ann,
+        id: `ann-${id}-${idx}`,
+        targetImageId: id,
+      })),
+      plot: object.plot ? { ...object.plot, sourceIds: object.plot.sourceIds.map(source => sourceIdMap.get(source) ?? source) } : undefined
+    };
+    if (prepared.plot && object.plot?.sourceIds.some((source, i) => source !== prepared.plot!.sourceIds[i])) attachPlot(prepared, mergedSources.map(source => source.id));
+    return prepared;
   });
 
   const normalized = preparedObjects.length ? extensionLayout(plan, idMap, preparedObjects) : null;
@@ -178,20 +210,32 @@ export function mergeFollowUpLesson(current: LessonPlan, plan: FollowUpPlan): Fo
     const mapped = segment.targetIds.map(mapTarget).filter((id): id is string => Boolean(id));
     return {
       ...segment,
+      cues: segment.cues?.flatMap(cue => { const targetId = mapTarget(cue.targetId); const toTargetId = cue.toTargetId ? mapTarget(cue.toTargetId) : undefined; return targetId && (!cue.toTargetId || toTargetId) ? [{ ...cue, targetId, toTargetId: toTargetId ?? undefined }] : []; }),
       id: uniqueId(`${prefix}-${safeId(segment.id, `step-${index + 1}`)}`, usedSegmentIds),
       title: segment.title.replace(/[<>]/g, "").slice(0, 80),
-      narration: segment.narration.replace(/[<>]/g, "").slice(0, 700),
+      narration: segment.narration.replace(/[<>]/g, "").slice(0, 2400),
       targetIds: mapped.length ? [...new Set(mapped)] : fallback ? [fallback] : segment.targetIds,
       durationMs: clamp(segment.durationMs, 1200, 45000),
     };
   });
+
+  const citedIds = new Set([...updatedExistingObjects, ...newObjects].flatMap(object => object.plot?.provenance === "sourced" ? object.plot.sourceIds : []));
+  const availableIds = new Set(mergedSources.map(source => source.id));
+  if ([...citedIds].some(id => !availableIds.has(id))) throw new Error("A plotted dataset references a source that is no longer available. Start a new lesson with that source.");
+  if (citedIds.size > 20) throw new Error("This board has reached its 20-source limit for plotted datasets. Start a new lesson to add more sources.");
+  const incomingSourceIds = new Set(sourceIdMap.values());
+  const prioritizedSources = [
+    ...mergedSources.filter(source => citedIds.has(source.id)),
+    ...mergedSources.filter(source => !citedIds.has(source.id) && incomingSourceIds.has(source.id)),
+    ...mergedSources.filter(source => !citedIds.has(source.id) && !incomingSourceIds.has(source.id)),
+  ].slice(0, 20);
 
   return {
     startIndex,
     newObjectIds: newObjects.map((object) => object.id),
     lesson: {
       ...current,
-      sources: [...new Map([...(plan.sources ?? []), ...current.sources].map(source => [source.url, source])).values()].map((source, index) => ({ ...source, id: `source-${index + 1}` })).slice(0, 20),
+      sources: prioritizedSources,
       summary: `${current.summary}${current.summary ? " " : ""}Follow-up: ${plan.answer}`.slice(0, 1600),
       objects: [...updatedExistingObjects, ...newObjects],
       connections: [...current.connections, ...internalConnections, ...crossConnections],

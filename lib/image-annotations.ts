@@ -14,7 +14,14 @@ export function compileImageAnnotationSkeletons(
   imageObject: VisualObject,
   annotations: ImageAnnotation[]
 ): ExcalidrawElementSkeleton[] {
-  if (!imageObject.image || !annotations.length) return [];
+  if (
+    !imageObject.image ||
+    !annotations.length ||
+    imageObject.image.provenance === "plot" ||
+    (imageObject as any).kind === "graph" ||
+    (imageObject as any).kind === "plot" ||
+    Boolean(imageObject.plot)
+  ) return [];
 
   const imgW = imageObject.width;
   const imgH = imageObject.width * (imageObject.image.height / imageObject.image.width);

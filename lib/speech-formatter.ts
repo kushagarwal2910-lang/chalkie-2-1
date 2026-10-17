@@ -7,14 +7,36 @@ import { sanitizeNarrationForSpeech } from "./local-speech.ts";
 
 // Common measurement units to expand for clear pronunciation
 const UNIT_REPLACEMENTS: [RegExp, string][] = [
-  // Speed & distance
-  [/\b(\d+(?:\.\d+)?)\s*km\/h\b/gi, "$1 kilometers per hour"],
+  // Speed, acceleration & distance
+  [/\b(\d+(?:\.\d+)?)\s*km\s*\/\s*s\b/gi, "$1 kilometers per second"],
+  [/\bkm\s*\/\s*s\b/gi, "kilometers per second"],
+  [/\b(\d+(?:\.\d+)?)\s*m\s*\/\s*(?:s\^2|s²)\b/gi, "$1 meters per second squared"],
+  [/\bm\s*\/\s*(?:s\^2|s²)\b/gi, "meters per second squared"],
+  [/\b(\d+(?:\.\d+)?)\s*m\s*\/\s*s\b/gi, "$1 meters per second"],
+  [/\bm\s*\/\s*s\b/gi, "meters per second"],
+  [/\b(\d+(?:\.\d+)?)\s*km\s*\/\s*h\b/gi, "$1 kilometers per hour"],
+  [/\bkm\s*\/\s*h\b/gi, "kilometers per hour"],
   [/\b(\d+(?:\.\d+)?)\s*mph\b/gi, "$1 miles per hour"],
+  [/\b(\d+(?:\.\d+)?)\s*rad\s*\/\s*s\b/gi, "$1 radians per second"],
+  [/\brad\s*\/\s*s\b/gi, "radians per second"],
   [/\b(\d+(?:\.\d+)?)\s*km\b/gi, "$1 kilometers"],
   [/\b(\d+(?:\.\d+)?)\s*m\b/gi, "$1 meters"],
   [/\b(\d+(?:\.\d+)?)\s*cm\b/gi, "$1 centimeters"],
   [/\b(\d+(?:\.\d+)?)\s*mm\b/gi, "$1 millimeters"],
   [/\b(\d+(?:\.\d+)?)\s*nm\b/gi, "$1 nanometers"],
+
+  // Energy, force & mass
+  [/\b(\d+(?:\.\d+)?)\s*J\s*\/\s*kg\b/gi, "$1 joules per kilogram"],
+  [/\bJ\s*\/\s*kg\b/gi, "joules per kilogram"],
+  [/\b(\d+(?:\.\d+)?)\s*N\s*\/\s*m\b/gi, "$1 newtons per meter"],
+  [/\bN\s*\/\s*m\b/gi, "newtons per meter"],
+  [/\b(\d+(?:\.\d+)?)\s*N\s*\/\s*kg\b/gi, "$1 newtons per kilogram"],
+  [/\bN\s*\/\s*kg\b/gi, "newtons per kilogram"],
+  [/\b(\d+(?:\.\d+)?)\s*kg\s*\/\s*(?:m\^3|m³)\b/gi, "$1 kilograms per cubic meter"],
+  [/\bkg\s*\/\s*(?:m\^3|m³)\b/gi, "kilograms per cubic meter"],
+  [/\b(\d+(?:\.\d+)?)\s*W\s*\/\s*(?:m\^2|m²)\b/gi, "$1 watts per square meter"],
+  [/\bW\s*\/\s*(?:m\^2|m²)\b/gi, "watts per square meter"],
+  [/\b(\d+(?:\.\d+)?)\s*kg\b/gi, "$1 kilograms"],
 
   // Weight & mass
   [/\b(\d+(?:\.\d+)?)\s*kg\b/gi, "$1 kilograms"],
@@ -71,7 +93,9 @@ const SYMBOL_REPLACEMENTS: [RegExp, string][] = [
   [/\s*\+\s*/g, " plus "],
   [/\s*=\s*/g, " equals "],
   [/\s*&\s*/g, " and "],
-  [/(\w+)\/(\w+)/g, "$1 or $2"], // e.g. input/output -> input or output
+  [/\b([a-zA-Z]{1,3})\s*\/\s*([a-zA-Z]{1,3})\b/g, "$1 divided by $2"],
+  [/\b(and|or|true|false|input|output|yes|no|read|write|client|server)\/(and|or|true|false|input|output|yes|no|read|write|client|server)\b/gi, "$1 or $2"],
+  [/([a-zA-Z0-9])\s*\/\s*([a-zA-Z0-9])/g, "$1 divided by $2"],
   // Mathematical and ML symbols
   [/x₁/g, "x 1"],
   [/x₂/g, "x 2"],
@@ -94,10 +118,15 @@ const SYMBOL_REPLACEMENTS: [RegExp, string][] = [
  * Formats a raw narration string with natural breath pauses,
  * expanded abbreviations, and phonetic spacing.
  */
-export function formatNarrationForSpeech(text: string): string {
+export function formatNarrationForSpeech(text: string, language?: string | { language?: string; mode?: string } | null): string {
   if (!text) return "";
 
-  let formatted = sanitizeNarrationForSpeech(text);
+  let formatted = sanitizeNarrationForSpeech(text, language);
+
+  // Strip "Beat / Step / Stage / Phase / Part" meta-labels
+  formatted = formatted.replace(/\b(?:Beat|Step|Stage|Phase|Part)\s+(?:one|two|three|four|five|six|\d+)\s*[:,.\-—]?\s*/gi, "");
+  formatted = formatted.replace(/\bkilometers?\s+divided\s+by\s+(?:seconds?|s)\b/gi, "kilometers per second");
+  formatted = formatted.replace(/\bkilometer\s+divided\s+by\s+s\b/gi, "kilometers per second");
 
   // 1. Expand technical units
   for (const [pattern, replacement] of UNIT_REPLACEMENTS) {
@@ -140,7 +169,7 @@ export function formatNarrationForSpeech(text: string): string {
   formatted = formatted.replace(/\s{2,}/g, " ").trim();
 
   // Final sanitation sweep for stray markdown or characters
-  formatted = sanitizeNarrationForSpeech(formatted);
+  formatted = sanitizeNarrationForSpeech(formatted, language);
 
   // Ensure clean terminal punctuation so the voice doesn't clip the final syllable
   if (!/[.!?]$/.test(formatted)) {

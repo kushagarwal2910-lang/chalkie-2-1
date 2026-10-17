@@ -109,9 +109,9 @@ const MASCULINE_VOICES = /\b(guy|david|mark|george|daniel|alex|oliver|ryan|eric|
 export type AvatarVoiceStyle = "mira" | "arjun" | "chalk";
 export interface AvatarVoicePreferences { uri: string | null; rate: number; pitch: number }
 export const AVATAR_VOICE_DEFAULTS: Record<AvatarVoiceStyle, AvatarVoicePreferences> = {
-  mira: { uri: null, rate: 0.92, pitch: 1.04 },
-  arjun: { uri: null, rate: 0.92, pitch: 1 },
-  chalk: { uri: null, rate: 1, pitch: 1.12 },
+  mira: { uri: null, rate: 1.0, pitch: 1.0 },
+  arjun: { uri: null, rate: 1.0, pitch: 1.0 },
+  chalk: { uri: null, rate: 1.0, pitch: 1.0 },
 };
 export function voicePreferenceKey(avatar: AvatarVoiceStyle) { return `chalkie:voice:${avatar}`; }
 export function readAvatarVoicePreferences(avatar: AvatarVoiceStyle, storage: Pick<Storage, "getItem">): AvatarVoicePreferences {

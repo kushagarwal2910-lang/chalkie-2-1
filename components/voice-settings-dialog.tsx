@@ -14,18 +14,25 @@ import { formatNarrationForSpeech } from "@/lib/speech-formatter";
 import { Check, Play, Square, Volume2, Sparkles, X } from "lucide-react";
 import { AvatarChoices, avatarOptions, useAvatarStyle } from "@/components/teacher-avatar";
 import { generateLocalSpeech, LOCAL_VOICES, readLocalVoice, readSpeechEngine, type SpeechEngine } from "@/lib/local-speech";
+import { defaultLessonLanguage, getLanguageSample, getMatchingDeviceVoice, isEnglishLessonLanguage, LANGUAGE_OPTIONS, normalizeLessonLanguage, type LessonLanguageSettings } from "@/lib/lesson-language";
+import { generateRemoteSpeech, readRemoteSpeechPreference, selectRemoteSpeechProvider, SARVAM_LANGUAGE_CODES, type RemoteSpeechPreference, type SpeechAvailability } from "@/lib/remote-speech";
 
 interface VoiceSettingsDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onVoiceChange?: (voiceUri: string, rate: number) => void;
+  languageSettings?: LessonLanguageSettings;
 }
 
 export function VoiceSettingsDialog({
   open,
   onOpenChange,
   onVoiceChange,
+  languageSettings = defaultLessonLanguage,
 }: VoiceSettingsDialogProps) {
+  const language = normalizeLessonLanguage(languageSettings);
+  const english = isEnglishLessonLanguage(language);
+  const languageName = LANGUAGE_OPTIONS.find(option => option.code === language.language)!.label;
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [selectedUri, setSelectedUri] = useState<string>("");
   const [avatar] = useAvatarStyle();
@@ -37,6 +44,8 @@ export function VoiceSettingsDialog({
   const [isPlayingSample, setIsPlayingSample] = useState(false);
   const sampleRef = useRef<SpeechSynthesisUtterance | null>(null);
   const [engine, setEngine] = useState<SpeechEngine>("device");
+  const [remotePreference, setRemotePreference] = useState<RemoteSpeechPreference>("auto");
+  const [availability, setAvailability] = useState<SpeechAvailability | null>(null);
   const [localVoice, setLocalVoice] = useState("af_heart");
   const [sampleStatus, setSampleStatus] = useState("");
   const localSampleRef = useRef<{ controller: AbortController; audio?: HTMLAudioElement; url?: string } | null>(null);
@@ -45,13 +54,14 @@ export function VoiceSettingsDialog({
   useEffect(() => {
     const loadVoices = () => {
       const available = window.speechSynthesis?.getVoices() ?? [];
-      if (available.length) {
-        const ranked = getRankedVoices(available);
+      const matching = available.filter(voice => voice.lang.toLowerCase().replaceAll("_", "-").split("-")[0] === language.language.split("-")[0]);
+      {
+        const ranked = getRankedVoices(matching);
         setVoices(ranked);
 
         const preferences = readAvatarVoicePreferences(avatar, window.localStorage);
         const best = getBestAvailableVoice(ranked, preferences.uri, avatar);
-        if (best) setSelectedUri(best.voiceURI || best.name);
+        setSelectedUri(best?.voiceURI || best?.name || "");
       }
     };
 
@@ -61,14 +71,21 @@ export function VoiceSettingsDialog({
       setSpeechRate(preferences.rate);
       setSpeechPitch(preferences.pitch);
       setManualUri(preferences.uri);
-      setEngine(readSpeechEngine());
+      const preferredEngine = readSpeechEngine();
+      setEngine(english ? preferredEngine : "remote");
+      setRemotePreference(readRemoteSpeechPreference());
       setLocalVoice(readLocalVoice(avatar));
       setSampleStatus("");
       setIsPlayingSample(false);
       setSampleActive(false);
     }, 0);
     window.speechSynthesis?.addEventListener("voiceschanged", loadVoices);
+    const controller = new AbortController();
+    fetch("/api/speech", { signal: controller.signal }).then(response => response.ok ? response.json() : null).then(result => {
+      if (!controller.signal.aborted && result?.providers?.sarvam && result?.providers?.elevenlabs) setAvailability(result);
+    }).catch(() => { /* Device voices remain available without the optional provider. */ });
     return () => {
+      controller.abort();
       window.clearTimeout(initialLoad);
       window.speechSynthesis?.removeEventListener("voiceschanged", loadVoices);
       if (sampleRef.current) { sampleRef.current = null; window.speechSynthesis.cancel(); }
@@ -77,7 +94,7 @@ export function VoiceSettingsDialog({
       sample?.controller.abort(); sample?.audio?.pause();
       if (sample?.url) URL.revokeObjectURL(sample.url);
     };
-  }, [avatar, open]);
+  }, [avatar, open, english, language.language]);
 
   const stopSample = () => {
     const sample = localSampleRef.current;
@@ -115,20 +132,22 @@ export function VoiceSettingsDialog({
     }
 
     window.speechSynthesis?.cancel();
-    const sampleText = formatNarrationForSpeech(
-      `Hi, I'm ${teacherName}. Let's take this one step at a time. Follow the board as we explore how it works together.`
-    );
+    const sampleText = english ? formatNarrationForSpeech(`Hi, I'm ${teacherName}. Let's take this one step at a time. Follow the board as we explore how it works together.`) : getLanguageSample(language);
 
-    if (engine === "local") {
+    if (engine === "local" || engine === "remote") {
       const sample: NonNullable<typeof localSampleRef.current> = { controller: new AbortController() };
       localSampleRef.current = sample;
-      setSampleActive(true); setSampleStatus("Preparing your local voice…");
+      setSampleActive(true); setSampleStatus(engine === "local" ? "Preparing your local voice…" : "Preparing your natural voice…");
       try {
-        const recording = await generateLocalSpeech(sampleText, localVoice, speechRate, sample.controller.signal, message => { if (localSampleRef.current === sample) setSampleStatus(message); });
+        const isIndian = language.language in SARVAM_LANGUAGE_CODES || language.language.endsWith("-IN") || language.language.startsWith("en");
+        const effectivePref = isIndian ? "sarvam" : remotePreference;
+        const recording = engine === "remote"
+          ? (await generateRemoteSpeech(sampleText, language, speechRate, sample.controller.signal, effectivePref, avatar)).audio
+          : await generateLocalSpeech(sampleText, localVoice, speechRate, sample.controller.signal, message => { if (localSampleRef.current === sample) setSampleStatus(message); });
         if (localSampleRef.current !== sample) return;
         sample.url = URL.createObjectURL(recording);
         sample.audio = new Audio(sample.url);
-        sample.audio.onplaying = () => { if (localSampleRef.current === sample) { setIsPlayingSample(true); setSampleStatus("Playing locally · no speech API"); } };
+        sample.audio.onplaying = () => { if (localSampleRef.current === sample) { setIsPlayingSample(true); setSampleStatus(engine === "remote" ? "Playing natural voice · provider audio" : "Playing locally · no speech API"); } };
         sample.audio.onended = () => { if (localSampleRef.current === sample) stopSample(); };
         sample.audio.onerror = () => { if (localSampleRef.current === sample) { stopSample(); setSampleStatus("Audio could not play. Try Preview again."); } };
         await sample.audio.play();
@@ -141,8 +160,9 @@ export function VoiceSettingsDialog({
     if (!("speechSynthesis" in window)) return;
 
     const utterance = new SpeechSynthesisUtterance(sampleText);
-    const matchedVoice = voices.find((v) => v.voiceURI === selectedUri || v.name === selectedUri);
-    if (matchedVoice) utterance.voice = matchedVoice;
+    const matchedVoice = getMatchingDeviceVoice(voices, language, selectedUri);
+    if (!matchedVoice) { setSampleStatus(`No ${languageName} voice is available. Add one in your operating system, restart the browser, or use captions.`); return; }
+    utterance.voice = matchedVoice;
     utterance.rate = speechRate;
     utterance.pitch = speechPitch;
     utterance.lang = matchedVoice?.lang || "en-US";
@@ -186,10 +206,20 @@ export function VoiceSettingsDialog({
             <AvatarChoices speaking={isPlayingSample} />
             <fieldset>
               <legend className="mb-3 text-sm font-semibold">Voice engine</legend>
-              <div className="grid grid-cols-2 gap-2">
-                {([{ id: "local", name: "Local natural", detail: "Free · no API key" }, { id: "device", name: "Device voice", detail: "Instant · lightweight" }] as const).map(option => <button key={option.id} type="button" aria-pressed={engine === option.id} onClick={() => { stopSample(); setEngine(option.id); try { localStorage.setItem("chalkie:speech-engine", option.id); } catch { /* optional storage */ } }} className={`rounded-xl border p-3 text-left text-xs focus-visible:ring-2 focus-visible:ring-[#c4b5fd] ${engine === option.id ? "border-[#c4b5fd] bg-[#302c3b]" : "border-[#363a40] bg-[#17191c]"}`}><span className="block font-semibold">{option.name}</span><span className="mt-1 block text-[#a9adb6]">{option.detail}</span></button>)}
+              <div className="grid grid-cols-3 gap-2">
+                {([{ id: "local", name: "Local natural", detail: "Free · English" }, { id: "device", name: "Device voice", detail: "Free · no account" }, { id: "remote", name: "API natural", detail: "Optional · provider key" }] as const).map(option => <button key={option.id} type="button" disabled={option.id === "local" && !english || option.id === "remote" && (!availability || !selectRemoteSpeechProvider(language, availability))} aria-pressed={engine === option.id} onClick={() => { stopSample(); setEngine(option.id); try { localStorage.setItem("chalkie:speech-engine", option.id); } catch { /* optional storage */ } }} className={`rounded-xl border p-3 text-left text-xs focus-visible:ring-2 focus-visible:ring-[#c4b5fd] disabled:opacity-40 ${engine === option.id ? "border-[#c4b5fd] bg-[#302c3b]" : "border-[#363a40] bg-[#17191c]"}`}><span className="block font-semibold">{option.name}</span><span className="mt-1 block text-[#a9adb6]">{option.detail}</span></button>)}
               </div>
               {engine === "local" && <p className="mt-3 text-xs leading-5 text-[#a9adb6]">Kokoro runs on this device. First preview downloads about 120 MB, then your browser caches it. Speech takes device processing; slower devices may prefer Device voice. English voices; no speech is sent to an API.</p>}
+              {engine === "device" && <p className="mt-3 text-xs leading-5 text-[#a9adb6]">Showing {languageName} voices only. Device voices need no provider account; some operating system voices use a network connection. {!voices.length && `Add a ${languageName} voice in your operating system and restart the browser, or continue with captions.`}</p>}
+              {engine === "remote" && <label className="mt-3 block text-xs leading-5 text-[#a9adb6]">Natural voice provider
+                <select aria-label="Natural voice provider" value={remotePreference} onChange={event => { stopSample(); const choice = event.target.value as RemoteSpeechPreference; setRemotePreference(choice); try { localStorage.setItem("chalkie:remote-speech-provider", choice); } catch { /* optional storage */ } }} className="mt-2 w-full rounded-lg border border-[#363a40] bg-[#17191c] p-2 text-[#f3f3ee]">
+                  <option value="auto">Automatic for {languageName}</option>
+                  <option value="sarvam" disabled={!availability || !selectRemoteSpeechProvider(language, availability, "sarvam")}>Sarvam · Bulbul v3</option>
+                  <option value="elevenlabs" disabled={!availability || !selectRemoteSpeechProvider(language, availability, "elevenlabs")}>ElevenLabs · Flash v2.5</option>
+                </select>
+                Narration is sent to the configured provider. Provider usage may cost money. Keys stay on the server.
+              </label>}
+              {availability && !selectRemoteSpeechProvider(language, availability) && <p className="mt-3 text-xs leading-5 text-[#a9adb6]">No API voice is configured for {languageName}. Device voices and captions work without a provider account.</p>}
             </fieldset>
             <p className="text-xs leading-5 text-[#a9adb6]">Voice and pace are saved separately for {teacherName}. {avatar === "mira" ? "Mira automatically prefers a feminine voice." : avatar === "arjun" ? "Arjun automatically prefers a masculine voice." : "Chalk uses a bright, clear voice."}</p>
             <fieldset>
@@ -218,12 +248,12 @@ export function VoiceSettingsDialog({
               <select aria-label="Natural narrator" value={localVoice} onChange={event => { stopSample(); setLocalVoice(event.target.value); try { localStorage.setItem(`chalkie:local-voice:${avatar}`, event.target.value); } catch { /* optional storage */ } }} className="mt-3 w-full rounded-xl border border-[#363a40] bg-[#17191c] p-3 text-xs text-[#f3f3ee]">
                 {LOCAL_VOICES.map(voice => <option key={voice.id} value={voice.id}>{voice.label}{voice.avatar === avatar ? " · recommended" : ""}</option>)}
               </select>
-            </label> : <section aria-labelledby="voice-choice-heading">
+            </label> : engine === "device" ? <section aria-labelledby="voice-choice-heading">
               <div className="mb-3 flex flex-wrap items-center justify-between gap-2"><h3 id="voice-choice-heading" className="text-sm font-semibold">Narrator voice</h3><span className="inline-flex items-center gap-1.5 text-[10px] text-[#a9c9b0]"><Sparkles size={12} />Natural voices first</span></div>
               <button type="button" onClick={() => { const defaults = AVATAR_VOICE_DEFAULTS[avatar]; savePreferences(null, defaults.rate, defaults.pitch); }} className="mb-3 text-xs text-[#c4b5fd] underline underline-offset-4">Reset to {teacherName}&apos;s recommended voice</button>
               {!!voices.length && !voices.some(voice => /natural|neural|online/i.test(voice.name)) && <p className="mb-3 text-xs leading-5 text-[#a9adb6]">This browser offers classic device voices. Natural voices will appear here if your browser makes them available.</p>}
               <div className="max-h-[min(36dvh,300px)] min-h-[72px] space-y-2 overflow-y-auto overscroll-contain rounded-xl pr-1 [scrollbar-width:thin] [scrollbar-color:#50555d_transparent]">
-                {!voices.length && <div className="rounded-xl border border-dashed border-[#444950] bg-[#17191c] px-4 py-5 text-center text-xs leading-5 text-[#a9adb6]">Loading voices available on your device…</div>}
+                {!voices.length && <div className="rounded-xl border border-dashed border-[#444950] bg-[#17191c] px-4 py-5 text-center text-xs leading-5 text-[#a9adb6]">No {languageName} voice is available on this device.</div>}
                 {voices.map((voice) => {
                   const isSelected = selectedUri === voice.voiceURI || selectedUri === voice.name;
                   const isNatural = /natural|neural|online/i.test(voice.name);
@@ -234,7 +264,7 @@ export function VoiceSettingsDialog({
                   </button>;
                 })}
               </div>
-            </section>}
+            </section> : null}
           </div>
 
           <footer className="flex shrink-0 items-center justify-between gap-3 border-t border-[#363a40] bg-[#282c31] px-4 py-4 sm:px-6">

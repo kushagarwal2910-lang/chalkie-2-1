@@ -20,7 +20,7 @@ export function researchQuery(question: string) {
 
 /** Rank the excerpt we actually send, not a long passage whose tail is discarded. */
 export function relevantExcerpt(question: string, text: string, maxChars = 700) {
-  const terms = [...new Set(question.toLowerCase().match(/[a-z]{3,}/g) ?? [])].filter(term => !["the", "and", "how", "what", "why", "with", "this", "that", "explain", "include"].includes(term));
+  const terms = [...new Set(question.toLowerCase().match(/[\p{L}\p{M}\p{N}]{2,}/gu) ?? [])].filter(term => !["the", "and", "how", "what", "why", "with", "this", "that", "explain", "include"].includes(term));
   if (text.length <= maxChars) return text;
   let best = text.slice(0, maxChars), bestScore = -1;
   for (let start = 0; start < text.length; start += 200) {

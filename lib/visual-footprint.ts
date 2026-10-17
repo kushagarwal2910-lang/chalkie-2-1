@@ -1,6 +1,7 @@
 import type { VisualObject } from "./lesson-schema";
 import { getNetworkMinimumSize, getCycleMinimumSize } from "./template-geometry.ts";
 import { wrapConnectorLabel, connectorLabelTextWidth } from "./connector-routing.ts";
+import { wrapCardLabel } from "./teaching-layout.ts";
 
 /** The layout and the shape renderer must reserve exactly the same rectangle. */
 export function getVisualFootprint(object: VisualObject) {
@@ -42,45 +43,19 @@ export function getVisualFootprint(object: VisualObject) {
     minWidth = Math.max(420, Number.isFinite(object.width) && object.width > 0 ? object.width : 480);
     minHeight = Math.max(320, Number.isFinite(object.height) && object.height > 0 ? object.height : 330);
   } else if (object.shapeType === "note" || object.role === "formula") {
-    const isFormula = object.role === "formula" || /[=+Δ\\/*^]/.test(object.label || "");
-    const fontSize = object.role === "subject" ? 30 : 24;
-    const targetW = Math.max(isFormula ? 260 : 380, Number.isFinite(object.width) && object.width > 0 ? object.width : 380);
-    const availableWidth = Math.max(100, targetW - 36);
-    const maxLineChars = Math.max(28, Math.floor(availableWidth / 12));
-    const lines = object.label
-      ? object.label.split("\n").flatMap((line) => {
-          const trimmed = line.trim();
-          if (!trimmed) return [""];
-          if (trimmed.length <= maxLineChars) return [trimmed];
-          const words = trimmed.split(/\s+/);
-          const wrapped: string[] = [];
-          let cur = "";
-          for (const w of words) {
-            if (!cur) {
-              cur = w;
-            } else if ((cur + " " + w).length <= maxLineChars) {
-              cur += " " + w;
-            } else {
-              wrapped.push(cur);
-              cur = w;
-            }
-          }
-          if (cur) wrapped.push(cur);
-          return wrapped;
-        })
-      : [""];
-    const textH = lines.length * fontSize * 1.35 + 24;
-    minWidth = targetW;
-    minHeight = Math.max(isFormula ? 88 : 80, Math.round(textH));
+    const lines = wrapCardLabel(object.label || "", 25);
+    const longestLine = Math.max(...lines.map(l => l.length), 0);
+    minWidth = Math.max(380, longestLine * 14 + 64);
+    minHeight = Math.max(110, lines.length * 34 + 48);
   } else if (object.label) {
     // Standard shapes (rectangle, ellipse) with centered label
     const isEllipse = object.geo === "ellipse";
-    const targetW = Math.max(isEllipse ? 180 : 380, Number.isFinite(object.width) && object.width > 0 ? object.width : (isEllipse ? 180 : 380));
-    const wrapW = Math.max(100, targetW - 32);
-    const lines = wrapConnectorLabel(object.label, wrapW * 13 / 22 + 10).length;
-    const textH = lines * 28 + 32;
-    minWidth = isEllipse ? Math.max(targetW, Math.round(Math.min(380, (connectorLabelTextWidth(object.label) + 48) * 1.25))) : targetW;
-    minHeight = Math.max(80, Math.round(isEllipse ? textH * 1.3 : textH));
+    const lines = wrapCardLabel(object.label, 25);
+    const longestLine = Math.max(...lines.map(l => l.length), 0);
+    const baseW = Math.max(380, longestLine * 14 + 64);
+    const baseH = Math.max(110, lines.length * 34 + 48);
+    minWidth = isEllipse ? Math.max(baseW, Math.round(Math.min(420, (connectorLabelTextWidth(object.label) + 64) * 1.25))) : baseW;
+    minHeight = isEllipse ? Math.max(110, Math.round(baseH * 1.2)) : baseH;
   }
 
   if (object.parts?.some((part) => part.type === "axes")) {
