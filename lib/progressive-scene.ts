@@ -39,22 +39,50 @@ export function getProgressiveScene(
   const priorTargets = new Set<string>();
   for (let i = 0; i < activeStep && i < lesson.segments.length; i++) {
     const seg = lesson.segments[i];
-    if (seg && Array.isArray(seg.targetIds)) {
-      seg.targetIds.forEach((t) => {
-        priorTargets.add(t);
-        if (t.includes("#")) priorTargets.add(t.split("#")[0]);
-      });
+    if (seg) {
+      if (Array.isArray(seg.targetIds)) {
+        seg.targetIds.forEach((t) => {
+          priorTargets.add(t);
+          if (t.includes("#")) priorTargets.add(t.split("#")[0]);
+        });
+      }
+      if (Array.isArray(seg.cues)) {
+        seg.cues.forEach((c) => {
+          if (c.targetId) {
+            priorTargets.add(c.targetId);
+            if (c.targetId.includes("#")) priorTargets.add(c.targetId.split("#")[0]);
+          }
+          if (c.toTargetId) {
+            priorTargets.add(c.toTargetId);
+            if (c.toTargetId.includes("#")) priorTargets.add(c.toTargetId.split("#")[0]);
+          }
+        });
+      }
     }
   }
 
   // Targets revealed in the current activeStep
   const currentStepTargets = new Set<string>();
   const currentSeg = lesson.segments[activeStep];
-  if (currentSeg && Array.isArray(currentSeg.targetIds)) {
-    currentSeg.targetIds.forEach((t) => {
-      currentStepTargets.add(t);
-      if (t.includes("#")) currentStepTargets.add(t.split("#")[0]);
-    });
+  if (currentSeg) {
+    if (Array.isArray(currentSeg.targetIds)) {
+      currentSeg.targetIds.forEach((t) => {
+        currentStepTargets.add(t);
+        if (t.includes("#")) currentStepTargets.add(t.split("#")[0]);
+      });
+    }
+    if (Array.isArray(currentSeg.cues)) {
+      currentSeg.cues.forEach((c) => {
+        if (c.targetId) {
+          currentStepTargets.add(c.targetId);
+          if (c.targetId.includes("#")) currentStepTargets.add(c.targetId.split("#")[0]);
+        }
+        if (c.toTargetId) {
+          currentStepTargets.add(c.toTargetId);
+          if (c.toTargetId.includes("#")) currentStepTargets.add(c.toTargetId.split("#")[0]);
+        }
+      });
+    }
   }
 
   // Cumulative targets (0 through activeStep)

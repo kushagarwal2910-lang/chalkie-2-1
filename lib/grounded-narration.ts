@@ -53,11 +53,11 @@ export async function groundNarrationInImages(lesson: LessonPlan, question: stri
                 label: object.label,
                 availableImage: Boolean(object.image),
                 provenance: object.image?.provenance,
-                imageDescription: object.image?.description || object.label,
-                verifiedRegions: object.image?.regions.map(r => r.label) || [],
-                inspection: object.image?.description,
+                imageDescription: object.image?.description?.slice(0, 180) || object.label,
+                verifiedRegions: (object.image?.regions || []).filter(r => (r.confidence ?? 1) >= 0.78).map(r => r.label),
+                inspection: object.image?.description?.slice(0, 180),
                 plotData: (object as any).plotMetadata || object.plot,
-                regions: object.image?.regions.map((r, i) => ({ targetId: object.id + "#" + (r.id || i), label: r.label }))
+                regions: (object.image?.regions || []).filter(r => (r.confidence ?? 1) >= 0.78).map((r, i) => ({ targetId: `${object.id}#${r.id || r.label || i}`, label: r.label }))
               })),
               steps: lesson.segments.map(s => ({ title: s.title, draft: s.narration, targets: s.targetIds }))
             }) },
@@ -89,13 +89,11 @@ export async function groundNarrationInImages(lesson: LessonPlan, question: stri
           if (cue.kind === "arrow") { const to = resolveTeachingTarget(cue.toTargetId, objects, connections); return target.kind === "region" && to?.kind === "region" && target.objectId === to.objectId && target.id !== to.id; }
           return true;
         });
-        // Keep objects visible for every explicit cue, including multilingual phrases.
-        // Visibility needs owning object IDs, not one entry per subregion. Prioritize
-        // cued objects so many region cues cannot push a later object off the board.
+        // Keep targetIds preserving specific region anchors and connected cards
         segment.targetIds = [...new Set([
           ...segment.cues.flatMap(c => [c.targetId, ...(c.toTargetId ? [c.toTargetId] : [])]),
           ...segment.targetIds,
-        ].map(id => id.split("#")[0]))].slice(0,16);
+        ])].slice(0, 16);
         segment.language = lesson.language;
         segment.durationMs = Math.min(120000, Math.max(2500, segment.narration.length * 75));
       });

@@ -78,6 +78,7 @@ export const imageAssetSchema = z.object({
   provenance: z.enum(["retrieved", "user", "generated", "plot"]).optional(),
   description: z.string().max(600).optional(),
   id: z.string().max(100), title: z.string().max(300), url: z.string().url(),
+  thumbnailUrl: z.string().url().optional(),
   sourceUrl: z.string().url(), author: z.string().max(500), license: z.string().max(100),
   licenseUrl: z.string().url(), width: z.number().positive(), height: z.number().positive(),
   regions: z.array(imageRegionSchema).max(64),

@@ -50,11 +50,6 @@ export function compileExpression(expression: string): (x: number) => number {
     if (varMatch) input = input.replace(new RegExp(`\\b${varMatch[1]}\\b`, "g"), "x");
   }
 
-  // Detect Schwarzschild radius formulas
-  if (input.includes("2*g*x/c^2") || input.includes("2*g*m/c^2") || input.includes("2*g*x/c**2") || input.includes("2*g*m/c**2")) {
-    return x => 2.95325 * x;
-  }
-
   if (!input || input.length > 160) throw new Error("Invalid expression");
   const tokens = input.match(/(?:\d*\.)?\d+(?:e[+-]?\d+)?|[A-Za-z]+|[()+\-*/^]/g) ?? [];
   if (tokens.join("") !== input || tokens.length > 100) throw new Error("Unsupported expression; use arithmetic, x, sin, cos, tan, sqrt, abs, log, or exp");
@@ -103,19 +98,10 @@ export function compilePlot(raw: PlotSpec): { svg: string; regions: PlotRegion[]
   let ymin = Math.min(...points.map(p => p.y), ...(bars ? [0] : [])), ymax = Math.max(...points.map(p => p.y), ...(bars ? [0] : []));
   if (spec.kind === "curve") { xmin = spec.domain[0]; xmax = spec.domain[1]; }
 
-  // Flatline guard for compilePlot
+  // Domain-agnostic flatline guard
   if (Math.abs(ymax - ymin) < 1e-4 || (ymin === 0 && ymax === 0)) {
-    if (/schwarzschild|black\s*hole|radius|mass/i.test(`${spec.title} ${spec.expression}`)) {
-      points.forEach(p => { p.y = 2.95325 * p.x; });
-      series.forEach(s => s.points.forEach(p => { p.y = 2.95325 * p.x; }));
-      ymin = Math.min(...points.map(p => p.y));
-      ymax = Math.max(...points.map(p => p.y));
-    } else {
-      points.forEach(p => { p.y = 2.5 * ((p.x - xmin) / (xmax - xmin || 1)) + 1.0; });
-      series.forEach(s => s.points.forEach(p => { p.y = 2.5 * ((p.x - xmin) / (xmax - xmin || 1)) + 1.0; }));
-      ymin = Math.min(...points.map(p => p.y));
-      ymax = Math.max(...points.map(p => p.y));
-    }
+    ymin -= 1.0;
+    ymax += 1.0;
   }
 
   if (xmin === xmax) { xmin -= 1; xmax += 1; } if (ymin === ymax) { ymin -= 1; ymax += 1; }

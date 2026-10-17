@@ -122,30 +122,32 @@ export async function executeSourceAndGroundDiagram(
   const attached = await attachLessonImages(dummyLesson, dummyPlan, options);
   return attached.objects.find(o => o.id === "img-req")?.image ?? null;
 }
-
+export const searchAndGroundOpensourceImageInputSchema = sourceAndGroundDiagramInputSchema;
+export type SearchAndGroundOpensourceImageInput = SourceAndGroundDiagramInput;
+export const executeSearchAndGroundOpensourceImage = executeSourceAndGroundDiagram;
 // ============================================================================
 // 3. Tool: tool_render_matplotlib_graph
 // ============================================================================
 
 export const matplotlibToolInputSchema = z.object({
   title: z.string().min(1).max(160).describe("Descriptive title for the scientific plot"),
-  subtitleFormula: z.string().optional().describe("LaTeX mathtext formula rendered at top e.g. $v_{orb} = \\sqrt{GM/r}$"),
-  xAxisLabel: z.string().min(1).max(120).describe("Physical quantity with unit e.g. Orbital Radius r (Earth Radii)"),
-  yAxisLabel: z.string().min(1).max(120).describe("Physical quantity with unit e.g. Velocity (km/s)"),
+  subtitleFormula: z.string().optional().describe("Clean formula or mathematical relation rendered at top e.g. y = f(x)"),
+  xAxisLabel: z.string().min(1).max(120).describe("Domain quantity with units if applicable e.g. Quantity Q (units), Time t (s), Input Size n"),
+  yAxisLabel: z.string().min(1).max(120).describe("Domain quantity with units if applicable e.g. Price P ($), Rate V (μmol/min), Energy (J)"),
   xDomain: z.tuple([z.number(), z.number()]).describe("Range of x values [min, max]"),
   yDomain: z.tuple([z.number(), z.number()]).optional().describe("Optional range of y values [min, max]"),
   series: z.array(
     z.object({
-      label: z.string().min(1).max(80).describe("High-signal name e.g. Escape Velocity (km/s) — NEVER 'Curve 1'"),
+      label: z.string().min(1).max(80).describe("High-signal descriptive domain name e.g. 'Demand', 'Supply', 'Reaction Rate' — NEVER 'Curve 1'"),
       color: z.string().optional().describe("Hex color e.g. #38bdf8 or #f43f5e"),
-      formulaInX: z.string().optional().describe("Numpy formula expression in x e.g. 11.2 / np.sqrt(x)"),
+      formulaInX: z.string().optional().describe("Formula expression in x e.g. '100 - 0.9 * x'"),
       anchorPoints: z.array(
         z.object({
           x: z.number(),
           y: z.number(),
           callout: z.string().optional(),
         })
-      ).min(2).max(16).describe("Explicit physically calibrated (x, y) coordinates"),
+      ).min(2).max(16).describe("Explicit calibrated (x, y) coordinates"),
     })
   ).min(1).max(5),
   referenceLines: z.array(
@@ -171,8 +173,8 @@ export async function executeRenderMatplotlibGraph(
 
 export const formulaFlowchartCardSchema = z.object({
   id: z.string().optional(),
-  headline: z.string().min(1).max(80).describe("Short headline e.g. '1. Orbital Balance'"),
-  formula: z.string().optional().describe("Mathematical equation e.g. 'v_orb = \\sqrt{GM/r} \\approx 7.9 km/s'"),
+  headline: z.string().min(1).max(80).describe("Short headline e.g. 'Equilibrium Point', 'Base Case'"),
+  formula: z.string().optional().describe("Mathematical equation or core rule in Unicode math"),
   takeawayBullets: z.array(z.string().max(90)).min(1).max(3).describe("1 to 3 punchy takeaways"),
 });
 
@@ -286,6 +288,12 @@ export const AGENT_TOOLS = {
     description: "Fetches verified scientific domain passages and numerical constants/formulas from Tavily and user-uploaded sources.",
     schema: retrieveKnowledgeInputSchema,
     execute: executeRetrieveKnowledge,
+  },
+  tool_search_and_ground_opensource_image: {
+    name: "tool_search_and_ground_opensource_image",
+    description: "Searches Wikimedia Commons / Openverse with dual-query ranking and grounds regions using qwen/qwen3.8-27b thumbnail inspection.",
+    schema: searchAndGroundOpensourceImageInputSchema,
+    execute: executeSearchAndGroundOpensourceImage,
   },
   tool_source_and_ground_diagram: {
     name: "tool_source_and_ground_diagram",

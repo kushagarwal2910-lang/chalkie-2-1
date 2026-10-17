@@ -1,14 +1,49 @@
 /**
  * lib/graph-generator.ts
- * Keyless Scientific Graph Engine for Chalkie 2.0.
+ * Universal Scientific Graph Engine for Chalkie 2.0.
  * Transforms mathematical and quantitative graph specifications into self-grounded
  * high-resolution ImageAssets complete with normalized ImageRegion[] bounding boxes.
  *
+ * 100% Domain-Agnostic: Zero hardcoded subject matter presets or domain branching.
  * Primary Engine: Local Python Matplotlib helper (scripts/render_graph.py).
  * Fallback Engine: Zero-dependency pure-TypeScript scientific SVG plotter.
  */
 
 import type { ImageRegion } from "./lesson-schema.ts";
+
+export interface GraphPoint {
+  x: number;
+  y: number;
+  label?: string;
+  callout?: string;
+}
+
+export interface GraphSeries {
+  name: string;
+  color?: string;
+  points: GraphPoint[];
+  formulaInX?: string;
+  expression?: string;
+}
+
+export interface UniversalPlotSpec {
+  title: string;
+  subtitleFormula?: string;
+  chartKind?: "line" | "curve" | "bar" | "scatter" | string;
+  graphType?: string; // backwards compatibility alias for chartKind
+  xAxisLabel: string;
+  yAxisLabel: string;
+  xDomain?: [number, number];
+  yDomain?: [number, number];
+  series: GraphSeries[];
+  referenceLines?: Array<{
+    axis: "x" | "y";
+    value: number;
+    label: string;
+  }>;
+  width?: number;
+  height?: number;
+}
 
 export interface ScientificPlotSpec {
   title: string;
@@ -21,7 +56,7 @@ export interface ScientificPlotSpec {
     label: string;
     color?: string;
     formulaInX?: string;
-    anchorPoints: Array<{ x: number; y: number; callout?: string }>;
+    anchorPoints: Array<{ x: number; y: number; callout?: string; label?: string }>;
   }>;
   referenceLines?: Array<{
     axis: "x" | "y";
@@ -35,7 +70,8 @@ export interface ScientificPlotSpec {
 export interface GraphRequest {
   title: string;
   subtitleFormula?: string;
-  graphType?: "function-plot" | "wave-comparison" | "bar-chart" | "line-chart" | string;
+  chartKind?: "line" | "curve" | "bar" | "scatter" | string;
+  graphType?: string;
   xAxisLabel?: string;
   yAxisLabel?: string;
   seriesSpec?: string;
@@ -44,12 +80,12 @@ export interface GraphRequest {
   yDomain?: [number, number];
   width?: number;
   height?: number;
-  points?: Array<{ x: number; y: number; label?: string }>;
+  points?: Array<{ x: number; y: number; label?: string; callout?: string }>;
   series?: Array<{
     name?: string;
     label?: string;
     points?: Array<{ x: number; y: number; label?: string; callout?: string }>;
-    anchorPoints?: Array<{ x: number; y: number; callout?: string }>;
+    anchorPoints?: Array<{ x: number; y: number; callout?: string; label?: string }>;
     color?: string;
     expression?: string;
     formulaInX?: string;
@@ -61,7 +97,7 @@ export interface GraphRequest {
   }>;
 }
 
-export type GraphRequestInput = GraphRequest | ScientificPlotSpec;
+export type GraphRequestInput = GraphRequest | ScientificPlotSpec | UniversalPlotSpec;
 
 export interface PlotMetadata {
   xMin: number;
@@ -85,7 +121,9 @@ export interface ScientificGraphResult {
   plotMetadata?: PlotMetadata;
 }
 
-function parseExplicitPointsTs(text: string): Array<{ x: number; y: number; callout?: string }> | null {
+const CHALK_PALETTE = ["#38bdf8", "#f43f5e", "#a78bfa", "#34d399", "#fbbf24", "#e879f9"];
+
+function parseExplicitPointsTs(text: string): Array<{ x: number; y: number; label?: string }> | null {
   if (!text) return null;
   const matches = [...text.matchAll(/[\(\[]\s*(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)\s*,\s*(-?\d+(?:\.\d+)?(?:e[+-]?\d+)?)\s*[\)\]]/g)];
   if (matches.length >= 2) {
@@ -123,61 +161,60 @@ function escapeXml(unsafe: string): string {
 }
 
 /**
- * Pure TypeScript Zero-Dependency Scientific SVG Plotter.
- * Renders dark blackboard graph with glowing curve paths and mathematically exact ImageRegion bounding boxes.
+ * Pure TypeScript Zero-Dependency Universal Scientific SVG Plotter.
+ * Renders publication-grade dark chalkboard graph with glowing chalk paths,
+ * 12% breathing room, and mathematically exact ImageRegion bounding boxes.
  */
 export function renderScientificSvgGraph(req: GraphRequestInput): ScientificGraphResult {
   const W = req.width || 800;
   const H = req.height || 520;
-  const title = req.title || "Scientific Mathematical Plot";
+  const title = req.title || "Scientific Data Plot";
   const xLabel = req.xAxisLabel || "x";
   const yLabel = req.yAxisLabel || "y";
   const subtitleFormula = req.subtitleFormula || "";
 
-  let [minX, maxX] = (req as any).xDomain || (req as any).domain || [1, 10];
+  let chartKind = ((req as any).chartKind || (req as any).graphType || "curve").toLowerCase();
+  if (chartKind === "wave-comparison" || chartKind === "function-plot") {
+    chartKind = "curve";
+  } else if (chartKind === "line-chart" || chartKind === "timeline") {
+    chartKind = "line";
+  } else if (chartKind === "bar-chart") {
+    chartKind = "bar";
+  }
 
   interface SvgSeries {
     name: string;
     color: string;
-    points: { x: number; y: number; callout?: string }[];
+    points: { x: number; y: number; label?: string }[];
     samples: { x: number; y: number }[];
   }
 
   const svgSeries: SvgSeries[] = [];
-  const sampleCount = 200;
-  const colors = ["#38bdf8", "#f43f5e", "#a78bfa", "#34d399", "#fbbf24"];
-
-  // Normalize incoming series: Check structured series vs legacy seriesSpec
   const rawSeries = req.series;
+
   if (Array.isArray(rawSeries) && rawSeries.length > 0) {
     rawSeries.forEach((s, idx) => {
-      const name = (s as any).label || (s as any).name || `Series ${idx + 1}`;
-      const color = s.color || colors[idx % colors.length];
-      const rawAnchors = (s as any).anchorPoints || (s as any).points || [];
-      const anchors: Array<{ x: number; y: number; callout?: string }> = rawAnchors.map((p: any) => ({
+      const name = (s as any).name || (s as any).label || `Series ${idx + 1}`;
+      const color = s.color || CHALK_PALETTE[idx % CHALK_PALETTE.length];
+      const rawPoints = (s as any).points || (s as any).anchorPoints || [];
+      const points: Array<{ x: number; y: number; label?: string }> = rawPoints.map((p: any) => ({
         x: Number(p.x),
         y: Number(p.y),
-        callout: p.callout || p.label,
-      }));
-
-      if (anchors.length >= 2) {
-        minX = Math.min(minX, ...anchors.map(a => a.x));
-        maxX = Math.max(maxX, ...anchors.map(a => a.x));
-      }
+        label: p.label || p.callout || "",
+      })).filter((p: any) => Number.isFinite(p.x) && Number.isFinite(p.y));
 
       svgSeries.push({
         name,
         color,
-        points: anchors,
+        points,
         samples: [],
       });
     });
-  } else {
-    // Parse from seriesSpec
+  } else if ((req as GraphRequest).seriesSpec) {
     const spec = (req as GraphRequest).seriesSpec || "";
     const parts = spec.split(";").map(s => s.trim()).filter(Boolean);
     parts.forEach((part, idx) => {
-      const color = colors[idx % colors.length];
+      const color = CHALK_PALETTE[idx % CHALK_PALETTE.length];
       let name = "";
       let expr = part;
       if (expr.includes(":")) {
@@ -189,82 +226,102 @@ export function renderScientificSvgGraph(req: GraphRequestInput): ScientificGrap
         expr = expr.split("|")[0].trim();
       }
       if (!name) {
-        if (expr.toLowerCase().includes("orbital")) name = "Orbital Velocity (km/s)";
-        else if (expr.toLowerCase().includes("escape")) name = "Escape Velocity (km/s)";
-        else name = `Profile ${idx + 1}`;
+        name = `Series ${idx + 1}`;
       }
       const explicit = parseExplicitPointsTs(expr);
-      const anchors = explicit || [];
-      if (anchors.length >= 2) {
-        minX = Math.min(minX, ...anchors.map(a => a.x));
-        maxX = Math.max(maxX, ...anchors.map(a => a.x));
-      }
       svgSeries.push({
         name,
         color,
-        points: anchors,
+        points: explicit || [],
         samples: [],
       });
     });
+  } else if ((req as any).points && Array.isArray((req as any).points)) {
+    const pts = (req as any).points
+      .map((p: any) => ({ x: Number(p.x), y: Number(p.y), label: p.label || p.callout || "" }))
+      .filter((p: any) => Number.isFinite(p.x) && Number.isFinite(p.y));
+    if (pts.length > 0) {
+      svgSeries.push({
+        name: title,
+        color: CHALK_PALETTE[0],
+        points: pts,
+        samples: [],
+      });
+    }
   }
 
-  // Fallback series if none parsed
+  // If no series parsed, create a clean default 2-point unit segment
   if (!svgSeries.length) {
     svgSeries.push({
       name: title,
-      color: "#38bdf8",
-      points: [
-        { x: 1, y: 7.91, callout: "LEO: 7.91 km/s" },
-        { x: 2, y: 5.59 },
-        { x: 4, y: 3.95 },
-        { x: 10, y: 2.50, callout: "GEO: 2.50 km/s" },
-      ],
+      color: CHALK_PALETTE[0],
+      points: [{ x: 0, y: 0 }, { x: 10, y: 10 }],
       samples: [],
     });
   }
 
-  if (minX >= maxX) {
-    minX = 1;
-    maxX = 10;
+  // Calculate X bounds with 12% breathing room
+  const allPointsX = svgSeries.flatMap(s => s.points.map(p => p.x));
+  let minX = allPointsX.length ? Math.min(...allPointsX) : 0;
+  let maxX = allPointsX.length ? Math.max(...allPointsX) : 10;
+
+  if ((req as any).xDomain && (req as any).xDomain.length === 2) {
+    [minX, maxX] = (req as any).xDomain;
+  } else if ((req as any).domain && (req as any).domain.length === 2) {
+    [minX, maxX] = (req as any).domain;
   }
 
-  // Sample points across domain
+  if (minX >= maxX) {
+    minX -= 1;
+    maxX += 1;
+  }
+
+  const spanX = maxX - minX || 1;
+  const padX = spanX * 0.12;
+  const plotMinX = (req as any).xDomain || (req as any).domain ? minX : minX - padX;
+  const plotMaxX = (req as any).xDomain || (req as any).domain ? maxX : maxX + padX;
+
+  // Sample points across domain for curve interpolation
+  const sampleCount = 200;
   svgSeries.forEach(s => {
     s.samples = [];
-    for (let i = 0; i <= sampleCount; i++) {
-      const x = minX + (i / sampleCount) * (maxX - minX);
-      if (s.points.length >= 2) {
+    if (s.points.length >= 2) {
+      for (let i = 0; i <= sampleCount; i++) {
+        const x = plotMinX + (i / sampleCount) * (plotMaxX - plotMinX);
         s.samples.push({ x, y: interpolateHermiteTs(s.points, x) });
-      } else {
-        s.samples.push({ x, y: 7.91 / Math.sqrt(Math.max(x, 0.5)) });
       }
+    } else if (s.points.length === 1) {
+      s.samples.push({ x: plotMinX, y: s.points[0].y }, { x: plotMaxX, y: s.points[0].y });
     }
   });
 
-  // Calculate Y bounds
+  // Calculate Y bounds with 12% breathing room
   const left = 85;
   const right = W - 45;
   const top = subtitleFormula ? 80 : 65;
   const bottom = H - 75;
 
-  let allY = svgSeries.flatMap(s => s.samples.map(p => p.y)).filter(Number.isFinite);
+  let allY = svgSeries.flatMap(s => [
+    ...s.points.map(p => p.y),
+    ...s.samples.map(p => p.y)
+  ]).filter(Number.isFinite);
+
   if (!allY.length) allY = [0, 10];
-  let minY = req.yDomain ? req.yDomain[0] : Math.min(...allY);
-  let maxY = req.yDomain ? req.yDomain[1] : Math.max(...allY);
+  let minY = Math.min(...allY);
+  let maxY = Math.max(...allY);
 
   if (minY === maxY) {
     minY -= 1;
     maxY += 1;
   }
-  const yPadding = (maxY - minY) * 0.12;
-  const isPos = minY >= 0 && /velocity|speed|radius|mass|distance/i.test(`${yLabel} ${title}`);
-  if (!req.yDomain) {
-    minY = isPos ? 0 : minY - yPadding;
-    maxY += yPadding * 1.15;
-  }
 
-  const toPx = (x: number) => left + ((x - minX) / (maxX - minX)) * (right - left);
-  const toPy = (y: number) => bottom - ((y - minY) / (maxY - minY)) * (bottom - top);
+  const spanY = maxY - minY || 1;
+  const padY = spanY * 0.12;
+  let plotMinY = (req as any).yDomain ? (req as any).yDomain[0] : (minY >= 0 && minY - padY < 0 ? 0 : minY - padY);
+  let plotMaxY = (req as any).yDomain ? (req as any).yDomain[1] : maxY + padY * 1.15;
+
+  const toPx = (x: number) => left + ((x - plotMinX) / (plotMaxX - plotMinX)) * (right - left);
+  const toPy = (y: number) => bottom - ((y - plotMinY) / (plotMaxY - plotMinY)) * (bottom - top);
 
   const svgParts: string[] = [];
   svgParts.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`);
@@ -284,14 +341,14 @@ export function renderScientificSvgGraph(req: GraphRequestInput): ScientificGrap
   const gridStepsY = 4;
   for (let i = 0; i <= gridStepsX; i++) {
     const gx = left + (i / gridStepsX) * (right - left);
-    const valX = minX + (i / gridStepsX) * (maxX - minX);
-    svgParts.push(`<line x1="${gx}" y1="${top}" x2="${gx}" y2="${bottom}" stroke="#222738" stroke-width="0.8" stroke-dasharray="4,4" opacity="0.8"/>`);
+    const valX = plotMinX + (i / gridStepsX) * (plotMaxX - plotMinX);
+    svgParts.push(`<line x1="${gx}" y1="${top}" x2="${gx}" y2="${bottom}" stroke="#222738" stroke-width="0.8" stroke-dasharray="4,4" opacity="0.85"/>`);
     svgParts.push(`<text x="${gx}" y="${bottom + 22}" fill="#94a3b8" font-size="11" font-family="system-ui, sans-serif" text-anchor="middle">${valX.toFixed(1)}</text>`);
   }
   for (let i = 0; i <= gridStepsY; i++) {
     const gy = top + (i / gridStepsY) * (bottom - top);
-    const valY = maxY - (i / gridStepsY) * (maxY - minY);
-    svgParts.push(`<line x1="${left}" y1="${gy}" x2="${right}" y2="${gy}" stroke="#222738" stroke-width="0.8" stroke-dasharray="4,4" opacity="0.8"/>`);
+    const valY = plotMaxY - (i / gridStepsY) * (plotMaxY - plotMinY);
+    svgParts.push(`<line x1="${left}" y1="${gy}" x2="${right}" y2="${gy}" stroke="#222738" stroke-width="0.8" stroke-dasharray="4,4" opacity="0.85"/>`);
     svgParts.push(`<text x="${left - 12}" y="${gy + 4}" fill="#94a3b8" font-size="11" font-family="system-ui, sans-serif" text-anchor="end">${valY.toFixed(1)}</text>`);
   }
 
@@ -308,7 +365,7 @@ export function renderScientificSvgGraph(req: GraphRequestInput): ScientificGrap
         svgParts.push(`<text x="${px + 6}" y="${top + 16}" fill="#a1a1aa" font-size="10" font-style="italic">${escapeXml(ref.label)}</text>`);
       }
     }
-  } else if (minY <= 0 && maxY >= 0) {
+  } else if (plotMinY <= 0 && plotMaxY >= 0) {
     const y0 = toPy(0);
     svgParts.push(`<line x1="${left}" y1="${y0}" x2="${right}" y2="${y0}" stroke="#3f3f46" stroke-width="1.0" opacity="0.7"/>`);
   }
@@ -320,21 +377,74 @@ export function renderScientificSvgGraph(req: GraphRequestInput): ScientificGrap
   svgParts.push(`<text x="${(left + right) / 2}" y="${H - 22}" fill="#f1f5f9" font-size="12" font-family="system-ui, sans-serif" font-weight="500" text-anchor="middle">${escapeXml(xLabel)}</text>`);
   svgParts.push(`<text x="24" y="${(top + bottom) / 2}" transform="rotate(-90 24 ${(top + bottom) / 2})" fill="#f1f5f9" font-size="12" font-family="system-ui, sans-serif" font-weight="500" text-anchor="middle">${escapeXml(yLabel)}</text>`);
 
-  // Render Curves
-  svgSeries.forEach((s) => {
-    let d = "";
-    s.samples.forEach((p, idx) => {
-      const px = toPx(p.x).toFixed(1);
-      const py = toPy(p.y).toFixed(1);
-      d += `${idx === 0 ? "M" : "L"}${px},${py} `;
-    });
-    // Glow Halo
-    svgParts.push(`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="5.5" stroke-linecap="round" opacity="0.18"/>`);
-    // Main Crisp Line
-    svgParts.push(`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2.4" stroke-linecap="round"/>`);
-  });
+  // Render Series by chartKind
+  if (chartKind === "bar") {
+    const numS = svgSeries.length;
+    const allX = Array.from(new Set(svgSeries.flatMap(s => s.points.map(p => p.x)))).sort((a, b) => a - b);
+    let minDx = 1.0;
+    if (allX.length > 1) {
+      const diffs = allX.slice(1).map((x, i) => x - allX[i]).filter(d => d > 1e-4);
+      if (diffs.length) minDx = Math.min(...diffs);
+    }
+    const totalGroupW = Math.max(12, Math.min(80, (toPx(plotMinX + minDx) - toPx(plotMinX)) * 0.72));
+    const singleBarW = totalGroupW / Math.max(1, numS);
 
-  // Callouts & Dots
+    svgSeries.forEach((s, sIdx) => {
+      const offset = (sIdx - (numS - 1) / 2) * singleBarW;
+      s.points.forEach(p => {
+        const cx = toPx(p.x) + offset;
+        const cy = toPy(p.y);
+        const yBase = toPy(Math.max(0, plotMinY));
+        const barY = Math.min(cy, yBase);
+        const barH = Math.max(2, Math.abs(cy - yBase));
+        svgParts.push(`<rect x="${cx - singleBarW / 2}" y="${barY}" width="${singleBarW}" height="${barH}" fill="${s.color}" fill-opacity="0.88" stroke="${s.color}" stroke-width="1.2" rx="3"/>`);
+      });
+    });
+  } else if (chartKind === "scatter") {
+    svgSeries.forEach(s => {
+      s.points.forEach(p => {
+        const cx = toPx(p.x);
+        const cy = toPy(p.y);
+        svgParts.push(`<circle cx="${cx}" cy="${cy}" r="9" fill="${s.color}" opacity="0.25"/>`);
+        svgParts.push(`<circle cx="${cx}" cy="${cy}" r="4.5" fill="${s.color}" stroke="#ffffff" stroke-width="1.2"/>`);
+      });
+    });
+  } else if (chartKind === "line") {
+    svgSeries.forEach(s => {
+      let d = "";
+      s.points.forEach((p, idx) => {
+        const px = toPx(p.x).toFixed(1);
+        const py = toPy(p.y).toFixed(1);
+        d += `${idx === 0 ? "M" : "L"}${px},${py} `;
+      });
+      svgParts.push(`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="5.5" stroke-linecap="round" opacity="0.18"/>`);
+      svgParts.push(`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2.4" stroke-linecap="round"/>`);
+      s.points.forEach(p => {
+        const cx = toPx(p.x);
+        const cy = toPy(p.y);
+        svgParts.push(`<circle cx="${cx}" cy="${cy}" r="4" fill="${s.color}" stroke="#ffffff" stroke-width="1"/>`);
+      });
+    });
+  } else {
+    // Default: "curve" with smooth Hermite interpolation passing strictly through points
+    svgSeries.forEach(s => {
+      let d = "";
+      s.samples.forEach((p, idx) => {
+        const px = toPx(p.x).toFixed(1);
+        const py = toPy(p.y).toFixed(1);
+        d += `${idx === 0 ? "M" : "L"}${px},${py} `;
+      });
+      svgParts.push(`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="5.5" stroke-linecap="round" opacity="0.18"/>`);
+      svgParts.push(`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2.4" stroke-linecap="round"/>`);
+      s.points.forEach(p => {
+        const cx = toPx(p.x);
+        const cy = toPy(p.y);
+        svgParts.push(`<circle cx="${cx}" cy="${cy}" r="3.5" fill="${s.color}" stroke="#ffffff" stroke-width="0.8"/>`);
+      });
+    });
+  }
+
+  // Callouts & Normalized ImageRegion[] bounding boxes
   const regions: ImageRegion[] = [];
   const boxW = 0.16;
   const boxH = 0.11;
@@ -359,19 +469,30 @@ export function renderScientificSvgGraph(req: GraphRequestInput): ScientificGrap
 
   svgSeries.forEach((s, sIdx) => {
     s.points.forEach((pt, pIdx) => {
-      if (pt.callout) {
+      if (pt.label) {
         const cx = toPx(pt.x);
         const cy = toPy(pt.y);
-        svgParts.push(`<circle cx="${cx}" cy="${cy}" r="7" fill="${s.color}" opacity="0.25"/>`);
-        svgParts.push(`<circle cx="${cx}" cy="${cy}" r="3.5" fill="${s.color}"/>`);
+        svgParts.push(`<circle cx="${cx}" cy="${cy}" r="8" fill="${s.color}" opacity="0.25"/>`);
+        svgParts.push(`<circle cx="${cx}" cy="${cy}" r="4" fill="${s.color}"/>`);
         const tx = cx > (left + right) * 0.55 ? cx - 110 : cx + 15;
         const ty = cy > (top + bottom) * 0.55 ? cy - 20 : cy + 20;
-        svgParts.push(`<rect x="${tx - 6}" y="${ty - 14}" width="${pt.callout.length * 7 + 14}" height="20" rx="4" fill="#181a24" stroke="#52525b" stroke-width="0.8"/>`);
-        svgParts.push(`<text x="${tx}" y="${ty}" fill="#f8fafc" font-size="10" font-family="system-ui, sans-serif">${escapeXml(pt.callout)}</text>`);
-        regions.push(toNormRegion(pt.x, pt.y, pt.callout, `anchor_${sIdx}_${pIdx}`));
+        const badgeW = pt.label.length * 7 + 16;
+        svgParts.push(`<rect x="${tx - 6}" y="${ty - 14}" width="${badgeW}" height="20" rx="4" fill="#181a24" stroke="#52525b" stroke-width="0.8"/>`);
+        svgParts.push(`<text x="${tx}" y="${ty}" fill="#f8fafc" font-size="10" font-family="system-ui, sans-serif">${escapeXml(pt.label)}</text>`);
+        regions.push(toNormRegion(pt.x, pt.y, pt.label, `point_${sIdx}_${pIdx}`));
       }
     });
   });
+
+  // If no explicit point callouts exist, annotate peak of the first series
+  if (regions.length === 0 && svgSeries.length > 0) {
+    const s0 = svgSeries[0];
+    const pts = s0.points.length ? s0.points : s0.samples;
+    if (pts.length > 0) {
+      const peakPt = pts.reduce((max, p) => p.y > max.y ? p : max, pts[0]);
+      regions.push(toNormRegion(peakPt.x, peakPt.y, `${s0.name} Maximum`, "peak_0"));
+    }
+  }
 
   // Legend Box (Top Right)
   const legX = right - 220;
@@ -410,29 +531,22 @@ export function renderScientificSvgGraph(req: GraphRequestInput): ScientificGrap
   const base64Svg = typeof Buffer !== "undefined"
     ? Buffer.from(svgContent, "utf-8").toString("base64")
     : btoa(unescape(encodeURIComponent(svgContent)));
-  const dataUrl = `data:image/svg+xml;base64,${base64Svg}`;
+  const dataUrl = `data:image/svg+xml;base64,{base64Svg}`;
 
   const plotMetadata: PlotMetadata = {
-    xMin: Number(minX.toFixed(2)),
-    xMax: Number(maxX.toFixed(2)),
-    yMin: Number(minY.toFixed(2)),
-    yMax: Number(maxY.toFixed(2)),
+    xMin: Number(plotMinX.toFixed(2)),
+    xMax: Number(plotMaxX.toFixed(2)),
+    yMin: Number(plotMinY.toFixed(2)),
+    yMax: Number(plotMaxY.toFixed(2)),
     seriesSummary: svgSeries.map(s => {
-      const allVals = s.samples.map(p => p.y);
-      let peakIdx = 0;
-      let maxVal = -Infinity;
-      s.samples.forEach((p, idx) => {
-        if (p.y > maxVal) {
-          maxVal = p.y;
-          peakIdx = idx;
-        }
-      });
+      const vals = s.points.length ? s.points.map(p => p.y) : s.samples.map(p => p.y);
+      const peakPt = s.points.length ? s.points.reduce((max, p) => p.y > max.y ? p : max, s.points[0]) : s.samples[0];
       return {
         name: s.name,
-        peakX: Number(s.samples[peakIdx].x.toFixed(2)),
-        peakY: Number(s.samples[peakIdx].y.toFixed(2)),
-        minY: Number(Math.min(...allVals).toFixed(2)),
-        maxY: Number(Math.max(...allVals).toFixed(2)),
+        peakX: Number((peakPt?.x ?? 0).toFixed(2)),
+        peakY: Number((peakPt?.y ?? 0).toFixed(2)),
+        minY: Number(Math.min(...vals).toFixed(2)),
+        maxY: Number(Math.max(...vals).toFixed(2)),
       };
     }),
   };
@@ -469,6 +583,9 @@ async function runPythonGraphEngine(payload: GraphRequestInput): Promise<Scienti
         }
         try {
           const parsed = JSON.parse(stdout);
+          if (parsed && parsed.error) {
+            return reject(new Error(parsed.message || parsed.error));
+          }
           if (parsed && parsed.dataUrl && Array.isArray(parsed.regions)) {
             return resolve(parsed as ScientificGraphResult);
           }
@@ -485,7 +602,7 @@ async function runPythonGraphEngine(payload: GraphRequestInput): Promise<Scienti
 }
 
 /**
- * Main Entry Point: Keyless Scientific Graph Engine.
+ * Main Entry Point: Universal Scientific Graph Engine.
  * 1. Tries local Python Matplotlib renderer (sub-2s execution).
  * 2. If unavailable or times out, seamlessly falls back to pure-TS SVG scientific plotter.
  */

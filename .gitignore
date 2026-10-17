@@ -53,6 +53,7 @@ next-env.d.ts
 # Chalkie dev encryption secret (auto-generated)
 .chalkie-dev-secret
 
+scratch/
 scratch/screenshots/
 
 /public/excalidraw/

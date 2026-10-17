@@ -83,10 +83,10 @@ export type CanvasConceptFocusPlan = z.infer<typeof canvasConceptFocusPlanSchema
 export const scientificGraphPlotPlanSchema = z.object({
   action: z.literal("scientific_graph_plot"),
   rationale: z.string().max(300).describe("Why a scientific graph or mathematical plot is required"),
-  graphType: z.enum(["function-plot", "wave-comparison", "bar-chart", "line-chart"]).default("wave-comparison"),
-  xAxisLabel: z.string().max(80).default("Time (s)"),
-  yAxisLabel: z.string().max(80).default("Amplitude / Displacement"),
-  seriesSpec: z.string().max(500).default("Damped Wave: exp(-0.25*x)*cos(3*x) | #38bdf8; Resonant Amplification: 0.18*x*cos(3*x) | #f43f5e"),
+  graphType: z.enum(["function-plot", "wave-comparison", "bar-chart", "line-chart", "curve", "scatter"]).default("line-chart"),
+  xAxisLabel: z.string().max(80).default("x"),
+  yAxisLabel: z.string().max(80).default("y"),
+  seriesSpec: z.string().max(500).default(""),
 });
 export type ScientificGraphPlotPlan = z.infer<typeof scientificGraphPlotPlanSchema>;
 

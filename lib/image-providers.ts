@@ -24,7 +24,8 @@ export function openverseAsset(item: OpenverseImage): ImageAsset | null {
   if (attribution && !/^[1-4]\.0$/.test(item.license_version)) return null;
   const url = isLibraryImageUrl(item.url) ? item.url : item.thumbnail;
   if (!isLibraryImageUrl(url)) return null;
-  return { id: `openverse-${item.id}`, title: clean(item.title, 300), url, sourceUrl: item.foreign_landing_url,
+  const thumbnailUrl = item.thumbnail || url;
+  return { id: `openverse-${item.id}`, title: clean(item.title, 300), url, thumbnailUrl, sourceUrl: item.foreign_landing_url,
     author: clean(item.creator, 500) || "See original source", license: attribution ? `CC ${item.license.toUpperCase()} ${item.license_version}` : item.license === "cc0" ? "CC0" : "Public domain",
     licenseUrl: attribution ? `https://creativecommons.org/licenses/${item.license}/${item.license_version}/` : `https://creativecommons.org/publicdomain/${item.license === "cc0" ? "zero" : "mark"}/1.0/`,
     // Correct dimensions are read from the downloaded bytes before vision/layout.
@@ -37,29 +38,109 @@ async function getJson(url: string, signal?: AbortSignal) {
   return response.json();
 }
 
-export function candidateScore(a: ImageAsset): number {
+export function scoreImageCandidate(a: ImageAsset, query = ""): number {
   let score = 0;
-  const title = a.title.toLowerCase();
-  // Prefer printed English text labels on the diagram
-  if (/(?:\benglish\b|[-_]en[.\s_-])/.test(title)) score += 3;
-  if (/\b(labeled|labelled|annotated|diagram|with labels)\b/.test(title)) score += 4;
-  // Penalize numbered-only diagrams or blind numbered legends
-  if (/\b(numbered|numbers|numbers only|unlabeled|unlabelled|blank)\b/.test(title)) score -= 6;
+  const title = (a.title || "").toLowerCase();
+  const desc = (a.description || "").toLowerCase();
+  const combined = `${title} ${desc}`;
+  const url = (a.url || "").toLowerCase();
+  const sourceUrl = (a.sourceUrl || "").toLowerCase();
+
+  // 1. +35 pts: File extension is .svg or .png (clean vector/diagram formats)
+  if (/\.(svg|png)(\?|$)/i.test(url) || /\.(svg|png)(\?|$)/i.test(sourceUrl) || /\.(svg|png)$/i.test(title)) {
+    score += 35;
+  }
+
+  // 2. +30 pts: Title, categories, or snippet contain educational keywords
+  const educationalKeywordRegex = /\b(diagram|schematic|cross[- ]?section|anatomy|structure|mechanism|process|cycle|labeled|labelled|english|vector|illustration|chart|pathway)\b/i;
+  if (educationalKeywordRegex.test(combined)) {
+    score += 30;
+  }
+
+  // 3. +20 pts: Query token overlap ratio >= 0.6 in title or description
+  if (query.trim()) {
+    const cleanQ = query.toLowerCase().replace(/[^\p{L}\p{N}\s]+/gu, " ");
+    const words = cleanQ.split(/\s+/).filter(w => w.length > 2 && !/^(the|and|for|with|diagram|showing|about|how|why)$/i.test(w));
+    if (words.length > 0) {
+      const matchCount = words.filter(w => combined.includes(w)).length;
+      if (matchCount / words.length >= 0.6) {
+        score += 20;
+      }
+    }
+  }
+
+  // 4. -60 pts (Hard Penalty / Filter Out): Title or categories contain non-educational noise
+  const noiseRegex = /\b(statue|monument|building|exterior|portrait|grave|stamp|coin|logo|icon|flag|map of|book cover|page \d+|scanned|signature|autograph|trophy|museum exterior)\b/i;
+  if (noiseRegex.test(combined)) {
+    score -= 60;
+  }
+
+  // 5. -40 pts: Non-Latin/foreign-only title markers when English is requested
+  const foreignMarkerRegex = /(?:[-_](?:ru|zh|ar|ja|ko|de|fr|es|pl)\b|\bin\s+(?:russian|chinese|arabic|japanese|korean|german|french|spanish|polish)\b)/i;
+  if (foreignMarkerRegex.test(title)) {
+    score -= 40;
+  }
+
   return score;
 }
 
-/** Standalone image search: no Tavily key, research index, or LLM call. */
-export async function searchImageProvider(provider: ImageProvider, query: string, signal?: AbortSignal): Promise<ImageAsset[]> {
+export const candidateScore = scoreImageCandidate;
+
+async function fetchProviderQuery(provider: ImageProvider, query: string, signal?: AbortSignal): Promise<ImageAsset[]> {
   if (provider === "commons") {
-    const params = new URLSearchParams({ action: "query", format: "json", generator: "search", gsrsearch: `${query} -watermark`, gsrnamespace: "6", gsrlimit: "6", prop: "imageinfo", iiprop: "url|size|mime|extmetadata|sha1", iiurlwidth: "960" });
+    const params = new URLSearchParams({
+      action: "query", format: "json", generator: "search",
+      gsrsearch: `${query} -watermark`, gsrnamespace: "6", gsrlimit: "8",
+      prop: "imageinfo", iiprop: "url|size|mime|extmetadata|sha1", iiurlwidth: "1280"
+    });
     const data = await getJson(`https://commons.wikimedia.org/w/api.php?${params}`, signal) as { query?: { pages?: Record<string, CommonsPage & { index?: number }> } };
-    return Object.values(data.query?.pages ?? {}).sort((a, b) => (a.index ?? 0) - (b.index ?? 0)).map(commonsAsset).filter((a): a is ImageAsset => !!a && a.width >= 250 && a.height >= 150)
-      .filter(a => !/\bin .+ language\b/i.test(a.title) || /\benglish\b/i.test(a.title))
-      .sort((a, b) => candidateScore(b) - candidateScore(a));
+    return Object.values(data.query?.pages ?? {})
+      .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+      .map(commonsAsset)
+      .filter((a): a is ImageAsset => !!a && a.width >= 250 && a.height >= 150)
+      .filter(a => !/\bin .+ language\b/i.test(a.title) || /\benglish\b/i.test(a.title));
   }
   const params = new URLSearchParams({ q: query, license: "cc0,pdm,by,by-sa", mature: "false", page_size: "8" });
   const data = await getJson(`https://api.openverse.org/v1/images/?${params}`, signal) as { results?: OpenverseImage[] };
   return (data.results ?? []).map(openverseAsset).filter((a): a is ImageAsset => !!a);
+}
+
+/** Standalone image search with dual-query expansion and deterministic educational relevance ranking. */
+export async function searchImageProvider(provider: ImageProvider, query: string, signal?: AbortSignal): Promise<ImageAsset[]> {
+  const cleanQuery = query
+    .replace(/\b(diagram|schematic|cross[- ]?section|labeled|labelled|illustration)\b/gi, "")
+    .replace(/\s+/g, " ")
+    .trim() || query;
+
+  const query1 = `${cleanQuery} diagram OR schematic OR cross-section OR labeled`;
+  const query2 = cleanQuery;
+
+  // Dual-Query Search Expansion (Zero LLM Tokens) via Promise.allSettled
+  const results = await Promise.allSettled([
+    fetchProviderQuery(provider, query1, signal),
+    fetchProviderQuery(provider, query2, signal),
+  ]);
+
+  const candidates: ImageAsset[] = [];
+  const seenUrls = new Set<string>();
+  const seenTitles = new Set<string>();
+
+  for (const res of results) {
+    if (res.status === "fulfilled") {
+      for (const asset of res.value) {
+        const canonicalUrl = asset.url.split("?")[0].toLowerCase();
+        const canonicalTitle = asset.title.toLowerCase().trim();
+        if (!seenUrls.has(canonicalUrl) && !seenTitles.has(canonicalTitle)) {
+          seenUrls.add(canonicalUrl);
+          seenTitles.add(canonicalTitle);
+          candidates.push(asset);
+        }
+      }
+    }
+  }
+
+  // Sort candidates by descending deterministic relevance score
+  return candidates.sort((a, b) => scoreImageCandidate(b, query) - scoreImageCandidate(a, query));
 }
 
 /** Ordered, bounded fallbacks keep the common case to one library request. */

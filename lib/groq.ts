@@ -126,7 +126,7 @@ async function createPlan(
       // If Route D was requested, ensure coverage is append and a graph node exists
       if (visualDirective?.action === "scientific_graph_plot") {
         plan.coverage = "append";
-        const graphNode = plan.nodes.find(n => n.kind === "graph" || n.kind === "plot" || (n.seriesSpec && n.seriesSpec.length > 0) || /\b(graph|curve|wave|oscillation|resonant|damped|waveform)\b/i.test(n.label));
+        const graphNode = plan.nodes.find(n => n.kind === "graph" || n.kind === "plot" || (Boolean(n.seriesSpec) && (n.seriesSpec?.length ?? 0) > 0));
         if (graphNode) {
           graphNode.kind = "graph";
           if (!graphNode.graphType && visualDirective.graphType) graphNode.graphType = visualDirective.graphType;
@@ -137,15 +137,15 @@ async function createPlan(
           const fallbackGraphId = `follow-graph-${Date.now().toString(36).slice(4)}`;
           plan.nodes.unshift({
             id: fallbackGraphId,
-            label: "Wave & Resonance Comparison",
+            label: "Quantitative Graph Plot",
             kind: "graph",
             column: "full",
             imageQuery: "",
             regions: [],
-            graphType: visualDirective.graphType || "wave-comparison",
-            xAxisLabel: visualDirective.xAxisLabel || "Time (s)",
-            yAxisLabel: visualDirective.yAxisLabel || "Amplitude / Displacement",
-            seriesSpec: visualDirective.seriesSpec || "Damped Wave: exp(-0.25*x)*cos(3*x) | #38bdf8; Resonant Amplification: 0.18*x*cos(3*x) | #f43f5e",
+            graphType: visualDirective.graphType || "line-chart",
+            xAxisLabel: visualDirective.xAxisLabel || "x",
+            yAxisLabel: visualDirective.yAxisLabel || "y",
+            seriesSpec: visualDirective.seriesSpec || "",
           });
           if (plan.steps.length > 0 && !plan.steps[0].targetIds.includes(fallbackGraphId)) {
             plan.steps[0].targetIds.unshift(fallbackGraphId);
@@ -174,10 +174,10 @@ async function createPlan(
           try {
             const enhanced = await generateScientificGraph({
               title: object.label,
-              graphType: correspondingNode?.graphType || "wave-comparison",
-              xAxisLabel: correspondingNode?.xAxisLabel || "Time (s)",
-              yAxisLabel: correspondingNode?.yAxisLabel || "Amplitude / Displacement",
-              seriesSpec: correspondingNode?.seriesSpec || "Damped Wave: exp(-0.25*x)*cos(3*x) | #38bdf8; Resonant Amplification: 0.18*x*cos(3*x) | #f43f5e",
+              graphType: correspondingNode?.graphType || "line-chart",
+              xAxisLabel: correspondingNode?.xAxisLabel || "x",
+              yAxisLabel: correspondingNode?.yAxisLabel || "y",
+              seriesSpec: correspondingNode?.seriesSpec || "",
               series: correspondingNode?.plot?.series?.map(s => ({
                 name: s.name,
                 points: s.points,
@@ -328,7 +328,7 @@ export async function createFollowUpWithGroq(question: string, context: string, 
         xAxisLabel: decision.xAxisLabel,
         yAxisLabel: decision.yAxisLabel,
         seriesSpec: decision.seriesSpec,
-        instruction: `MANDATORY SCIENTIFIC GRAPH: The learner requested a mathematical graph, wave comparison, or curve plot. Set coverage: 'append'. You MUST include at least one node with kind: 'graph', label: '${("graphTitle" in decision ? String((decision as Record<string, unknown>).graphTitle) : "") || "Damped Oscillation vs Resonant Wave"}', graphType: '${decision.graphType || "wave-comparison"}', xAxisLabel: '${decision.xAxisLabel || "Time (s)"}', yAxisLabel: '${decision.yAxisLabel || "Amplitude / Displacement"}', and seriesSpec: '${decision.seriesSpec || "Damped Wave: exp(-0.25*x)*cos(3*x) | #38bdf8; Resonant Amplification: 0.18*x*cos(3*x) | #f43f5e"}'. Step 1 narration MUST introduce and explain this mathematical curve.`
+        instruction: `MANDATORY SCIENTIFIC GRAPH: The learner requested a mathematical graph, chart, or curve plot. Set coverage: 'append'. You MUST include at least one node with kind: 'graph', label: '${("graphTitle" in decision ? String((decision as Record<string, unknown>).graphTitle) : "") || "Quantitative Graph"}', graphType: '${decision.graphType || "line-chart"}', xAxisLabel: '${decision.xAxisLabel || "x"}', yAxisLabel: '${decision.yAxisLabel || "y"}', and seriesSpec: '${decision.seriesSpec || ""}'. Step 1 narration MUST introduce and explain this mathematical curve.`
       };
     } else if (decision.action === "canvas_concept_focus") {
       visualDirective = {

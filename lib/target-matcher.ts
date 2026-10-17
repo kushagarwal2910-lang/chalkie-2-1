@@ -96,5 +96,61 @@ export function computeTargetPositions(
   if (firstTarget && (!selected.length || selected[0].charIndex > 0)) {
     selected.unshift({ charIndex: 0, targetId: firstTarget.id, baseTargetId: firstTarget.objectId, partIndex: -1, partLabel: firstTarget.label, matchedToken: "step-anchor" });
   }
-  return selected;
+
+  // Intra-Step Visual Pacing (Image/Diagram First -> Crystallized Card Second):
+  // When a step explains both a visual region/anchor AND a connected card, transition focus
+  // to the card in the second half of narration if not already cued.
+  if (firstTarget && effectiveTargets.length > 1) {
+    const isAnchor = firstTarget.id.includes("#") ||
+      Boolean(objects.find(o => o.id === firstTarget.objectId)?.image) ||
+      objects.find(o => o.id === firstTarget.objectId)?.shapeType === "image";
+
+    if (isAnchor) {
+      const cardTargetId = effectiveTargets.find(id => {
+        const baseId = id.split("#")[0];
+        if (baseId === firstTarget.objectId) return false;
+        const obj = objects.find(o => o.id === baseId);
+        return obj && (obj.shapeType === "geo" || obj.shapeType === "note" || obj.role === "component" || obj.role === "annotation");
+      });
+
+      if (cardTargetId) {
+        const hasCardInSecondHalf = selected.some(
+          p => (p.targetId === cardTargetId || p.baseTargetId === cardTargetId.split("#")[0]) && p.charIndex >= spokenNarration.length * 0.35
+        );
+        if (!hasCardInSecondHalf && spokenNarration.length > 30) {
+          const cardResolved = resolveTeachingTarget(cardTargetId, objects, connections);
+          if (cardResolved) {
+            // Find optimal sentence boundary in [0.45, 0.75] span of narration
+            const midStart = Math.floor(spokenNarration.length * 0.45);
+            const midEnd = Math.floor(spokenNarration.length * 0.75);
+            const sub = spokenNarration.slice(midStart, midEnd);
+            const sentMatch = sub.match(/[.!?]\s+/);
+            const transitionCharIndex = sentMatch && sentMatch.index !== undefined
+              ? midStart + sentMatch.index + sentMatch[0].length
+              : Math.floor(spokenNarration.length * 0.5);
+
+            selected.push({
+              charIndex: transitionCharIndex,
+              targetId: cardResolved.id,
+              baseTargetId: cardResolved.objectId,
+              partIndex: -1,
+              partLabel: cardResolved.label,
+              matchedToken: "pacing-card-takeaway",
+            });
+            selected.sort((a, b) => a.charIndex - b.charIndex);
+          }
+        }
+      }
+    }
+  }
+
+  // Deduplicate consecutive identical targets
+  const pacedSelected: TargetPosition[] = [];
+  for (const pos of selected) {
+    if (pacedSelected.at(-1)?.targetId !== pos.targetId || pos.cue || pacedSelected.at(-1)?.cue) {
+      pacedSelected.push(pos);
+    }
+  }
+
+  return pacedSelected;
 }

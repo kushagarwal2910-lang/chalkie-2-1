@@ -1,8 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { cookies } from "next/headers";
-
 export const BYOK_COOKIE = "chalkie_byok";
 
 export type StoredProviderCredentials = {
@@ -104,6 +102,7 @@ export function decryptProviderCredentials(value: string): StoredProviderCredent
 
 export async function readByokCookie() {
   try {
+    const { cookies } = await import("next/headers");
     const value = (await cookies()).get(BYOK_COOKIE)?.value;
     return value ? decryptProviderCredentials(value) : null;
   } catch {

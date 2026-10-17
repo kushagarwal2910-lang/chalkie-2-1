@@ -1,8 +1,34 @@
 import { isLibraryImageUrl } from "./image-providers.ts";
+import { isCommonsImageUrl } from "./commons-images.ts";
 
 export class CommonsImageError extends Error {
   readonly status: number;
   constructor(message: string, status: number) { super(message); this.status = status; }
+}
+
+/**
+ * Returns a 640px-800px width thumbnail URL suitable for low-token VLM inspection.
+ * Keeps vision LLM token costs ~80% lower than full 1200px+ images while preserving
+ * exact [0..1] normalized coordinate precision.
+ */
+export function getVlmThumbnailUrl(url: string, targetWidth = 640): string {
+  if (!url || typeof url !== "string") return "";
+  if (url.startsWith("data:")) return url;
+
+  if (isCommonsImageUrl(url)) {
+    if (url.includes("/thumb/")) {
+      return url.replace(/\/\d+px-/, `/${targetWidth}px-`);
+    }
+    const match = url.match(/\/wikipedia\/commons\/([a-f0-9]\/[a-f0-9]{2}\/([^/?#]+))/i);
+    if (match) {
+      const fullPath = match[1];
+      const filename = match[2];
+      const extSuffix = filename.toLowerCase().endsWith(".svg") ? ".png" : "";
+      return `https://upload.wikimedia.org/wikipedia/commons/thumb/${fullPath}/${targetWidth}px-${filename}${extSuffix}`;
+    }
+  }
+
+  return url;
 }
 
 /** Fetch once on our server: Commons can reject a provider's remote URL fetch. */

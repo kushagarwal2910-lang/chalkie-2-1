@@ -221,7 +221,20 @@ export function ChalkCanvas({ lesson, activeSegment, activeStep, isPresenting, i
     const update = () => {
       const elements = api.getSceneElements();
       const target = resolveTeachingTarget(activeTarget, lesson.objects, lesson.connections, elements);
-      const destination = activeCue?.toTargetId ? resolveTeachingTarget(activeCue.toTargetId, lesson.objects, lesson.connections, elements) : null;
+      let destination: TeachingTarget | null = null;
+      if (activeCue?.toTargetId) {
+        destination = resolveTeachingTarget(activeCue.toTargetId, lesson.objects, lesson.connections, elements);
+      } else if (activeSegment?.targetIds && activeSegment.targetIds.length >= 2) {
+        const t0 = activeSegment.targetIds[0];
+        const t1 = activeSegment.targetIds[1];
+        if (t0 && t1 && t0.includes("#") && t1.includes("#")) {
+          const [img0] = t0.split("#");
+          const [img1] = t1.split("#");
+          if (img0 === img1 && (activeTarget === t0 || activeTarget === img0)) {
+            destination = resolveTeachingTarget(t1, lesson.objects, lesson.connections, elements);
+          }
+        }
+      }
       const state = api.getAppState();
       const snapshot = JSON.stringify([target, destination, state.zoom.value, state.scrollX, state.scrollY, state.width, state.height]);
       if (snapshot !== lastSnapshot) {
@@ -232,7 +245,7 @@ export function ChalkCanvas({ lesson, activeSegment, activeStep, isPresenting, i
     };
     frame = requestAnimationFrame(update);
     return () => cancelAnimationFrame(frame);
-  }, [api, ready, lesson, isSpeaking, activeTarget, activeCue?.toTargetId]);
+  }, [api, ready, lesson, isSpeaking, activeTarget, activeCue?.toTargetId, activeSegment?.targetIds]);
 
   useEffect(() => {
     if (!api || !lesson) return;
@@ -373,12 +386,23 @@ export function ChalkCanvas({ lesson, activeSegment, activeStep, isPresenting, i
         }
       }
       if (!target) return;
-      if (activeCue?.kind === "arrow" && activeCue.toTargetId) {
-        const destination = resolveTeachingTarget(activeCue.toTargetId, lesson.objects, lesson.connections, elements);
-        if (destination && interactionCurve(target, destination)) {
-          const bounds = boundsForPoints([...target.polygon, ...destination.polygon]);
-          target = { ...target, bounds, center: { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 } };
+      let intraDest: TeachingTarget | null = null;
+      if (activeCue?.toTargetId) {
+        intraDest = resolveTeachingTarget(activeCue.toTargetId, lesson.objects, lesson.connections, elements);
+      } else if (activeSegment?.targetIds && activeSegment.targetIds.length >= 2) {
+        const t0 = activeSegment.targetIds[0];
+        const t1 = activeSegment.targetIds[1];
+        if (t0 && t1 && t0.includes("#") && t1.includes("#")) {
+          const [img0] = t0.split("#");
+          const [img1] = t1.split("#");
+          if (img0 === img1 && (activeTarget === t0 || activeTarget === img0)) {
+            intraDest = resolveTeachingTarget(t1, lesson.objects, lesson.connections, elements);
+          }
         }
+      }
+      if (intraDest && target && interactionCurve(target, intraDest)) {
+        const bounds = boundsForPoints([...target.polygon, ...intraDest.polygon]);
+        target = { ...target, bounds, center: { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 } };
       }
       const state = api.getAppState();
       // The editor's state dimensions can lag a responsive panel resize by a React commit.
@@ -450,19 +474,26 @@ export function ChalkCanvas({ lesson, activeSegment, activeStep, isPresenting, i
   const curve = overlay?.destination ? interactionCurve(overlay.target, overlay.destination) : null;
   const curvePath = curve ? (() => { const a = screen(curve.start), b = screen(curve.control), c = screen(curve.end); return `M ${a.x} ${a.y} Q ${b.x} ${b.y} ${c.x} ${c.y}`; })() : null;
   const focusPath = screenPoints.length ? `M ${screenPoints.map(p => `${p.x} ${p.y}`).join(" L ")} Z` : "";
+  const mixPoint = (p: Point, q: Point, t: number) => ({ x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t });
+  const regionEllipsePath = (screenPoints.length === 4 && overlay?.target.kind === "region") ? (() => {
+    const [a, b, c, d] = screenPoints;
+    const center = mixPoint(a, c, 0.5);
+    const pts = Array.from({ length: 49 }, (_, i) => {
+      const angle = (i / 48) * Math.PI * 2;
+      return {
+        x: center.x + ((b.x - a.x) / 2) * Math.cos(angle) + ((d.x - a.x) / 2) * Math.sin(angle),
+        y: center.y + ((b.y - a.y) / 2) * Math.cos(angle) + ((d.y - a.y) / 2) * Math.sin(angle),
+      };
+    });
+    return `M ${pts.map(p => `${p.x} ${p.y}`).join(" L ")} Z`;
+  })() : "";
   let drawingPath = "";
   if (screenPoints.length === 4 && overlay?.target.kind === "region") {
     const [a, b, c, d] = screenPoints;
-    const mix = (p: Point, q: Point, t: number) => ({ x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t });
     if (activeCue?.kind === "circle") {
-      const center = mix(a, c, 0.5);
-      const points = Array.from({ length: 49 }, (_, i) => {
-        const angle = i / 48 * Math.PI * 2;
-        return { x: center.x + (b.x - a.x) / 2 * Math.cos(angle) + (d.x - a.x) / 2 * Math.sin(angle), y: center.y + (b.y - a.y) / 2 * Math.cos(angle) + (d.y - a.y) / 2 * Math.sin(angle) };
-      });
-      drawingPath = `M ${points.map(p => `${p.x} ${p.y}`).join(" L ")} Z`;
+      drawingPath = regionEllipsePath;
     } else if (activeCue?.kind === "bracket") {
-      const points = [mix(a, b, 0.18), a, d, mix(d, c, 0.18), mix(b, a, 0.18), b, c, mix(c, d, 0.18)];
+      const points = [mixPoint(a, b, 0.18), a, d, mixPoint(d, c, 0.18), mixPoint(b, a, 0.18), b, c, mixPoint(c, d, 0.18)];
       drawingPath = points.map((p, i) => `${i === 0 || i === 4 ? "M" : "L"} ${p.x} ${p.y}`).join(" ");
     }
   }
@@ -505,9 +536,9 @@ export function ChalkCanvas({ lesson, activeSegment, activeStep, isPresenting, i
             </path>
           </mask>}
         </defs>
-        {overlay.target.kind === "region" && <path d={focusPath} fill="#67e8f9" fillOpacity="0.09" stroke="#67e8f9" strokeOpacity="0.7" strokeWidth="1.5" strokeDasharray="5 4" />}
+        {overlay.target.kind === "region" && <path d={regionEllipsePath || focusPath} fill="#67e8f9" fillOpacity="0.12" stroke="#67e8f9" strokeOpacity="0.85" strokeWidth="2" strokeDasharray="6 4" />}
         {overlay.target.kind === "card" && <path d={focusPath} fill="#a78bfa" fillOpacity="0.06" stroke="#a78bfa" strokeOpacity="0.85" strokeWidth="2.5" strokeDasharray="8 5" />}
-        {activeCue?.kind === "arrow" && curvePath && <path d={curvePath} fill="none" stroke="#67e8f9" strokeWidth="3" strokeDasharray="8 6" strokeLinecap="round" markerEnd={`url(#${markerId}-arrow)`} mask={`url(#${markerId}-reveal)`} />}
+        {curvePath && (activeCue?.kind === "arrow" || (overlay.target.kind === "region" && overlay.destination?.kind === "region")) && <path d={curvePath} fill="none" stroke="#67e8f9" strokeWidth="3" strokeDasharray="8 6" strokeLinecap="round" markerEnd={`url(#${markerId}-arrow)`} mask={`url(#${markerId}-reveal)`} />}
         {drawingPath && <path key={drawingKey} d={drawingPath} fill="none" stroke="#fef08a" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" pathLength="1" strokeDasharray="1" strokeDashoffset="0">
           {!reducedMotion && <animate attributeName="stroke-dashoffset" from="1" to="0" dur="0.55s" fill="freeze" />}
         </path>}
